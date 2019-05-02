@@ -586,13 +586,12 @@ public class DefaultRheaKVStore implements RheaKVStore {
         checkState();
         final byte[] realStartKey = BytesUtil.nullToEmpty(startKey);
         if (endKey != null) {
-            Requires.requireTrue(BytesUtil.compare(realStartKey, endKey) < 0,
-                    "startKey must < endKey");
+            Requires.requireTrue(BytesUtil.compare(realStartKey, endKey) < 0, "startKey must < endKey");
         }
         Requires.requireTrue(limit > 0, "limit must > 0");
         final CompletableFuture<List<KVEntry>> future = new CompletableFuture<>();
-        internalSingleRegionScan(realStartKey, endKey, limit, readOnlySafe, future, this.failoverRetries,
-                null, this.onlyLeaderRead);
+        internalSingleRegionScan(realStartKey, endKey, limit, readOnlySafe, future, this.failoverRetries, null,
+            this.onlyLeaderRead);
         return FutureHelper.get(future, this.futureTimeoutMillis);
     }
 
@@ -651,7 +650,7 @@ public class DefaultRheaKVStore implements RheaKVStore {
     public CompletableFuture<Sequence> getSequence(final byte[] seqKey, final int step) {
         checkState();
         Requires.requireNonNull(seqKey, "seqKey");
-        Requires.requireTrue(step > 0, "step must > 0");
+        Requires.requireTrue(step >= 0, "step must >= 0");
         final CompletableFuture<Sequence> future = new CompletableFuture<>();
         internalGetSequence(seqKey, step, future, this.failoverRetries, null);
         return future;
@@ -670,6 +669,34 @@ public class DefaultRheaKVStore implements RheaKVStore {
     @Override
     public Sequence bGetSequence(final String seqKey, final int step) {
         return FutureHelper.get(getSequence(seqKey, step), this.futureTimeoutMillis);
+    }
+
+    @Override
+    public CompletableFuture<Long> getLatestSequence(final byte[] seqKey) {
+        final CompletableFuture<Long> cf = new CompletableFuture<>();
+        getSequence(seqKey, 0).whenComplete((sequence, throwable) -> {
+            if (throwable == null) {
+                cf.complete(sequence.getStartValue());
+            } else {
+                cf.completeExceptionally(throwable);
+            }
+        });
+        return cf;
+    }
+
+    @Override
+    public CompletableFuture<Long> getLatestSequence(final String seqKey) {
+        return getLatestSequence(BytesUtil.writeUtf8(seqKey));
+    }
+
+    @Override
+    public Long bGetLatestSequence(final byte[] seqKey) {
+        return FutureHelper.get(getLatestSequence(seqKey), this.futureTimeoutMillis);
+    }
+
+    @Override
+    public Long bGetLatestSequence(final String seqKey) {
+        return FutureHelper.get(getLatestSequence(seqKey), this.futureTimeoutMillis);
     }
 
     private void internalGetSequence(final byte[] seqKey, final int step, final CompletableFuture<Sequence> future,
@@ -845,8 +872,7 @@ public class DefaultRheaKVStore implements RheaKVStore {
         Requires.requireNonNull(key, "key");
         Requires.requireNonNull(value, "value");
         final CompletableFuture<Boolean> future = new CompletableFuture<>();
-        internalMerge(BytesUtil.writeUtf8(key), BytesUtil.writeUtf8(value), future, this.failoverRetries,
-                null);
+        internalMerge(BytesUtil.writeUtf8(key), BytesUtil.writeUtf8(value), future, this.failoverRetries, null);
         return future;
     }
 
@@ -1167,7 +1193,7 @@ public class DefaultRheaKVStore implements RheaKVStore {
                 retryRunner);
         if (regionEngine != null) {
             if (ensureOnValidEpoch(region, regionEngine, closure)) {
-                getRawKVStore(regionEngine).tryLockWith(key, keepLease, acquirer, closure);
+                getRawKVStore(regionEngine).tryLockWith(key, region.getStartKey(), keepLease, acquirer, closure);
             }
         } else {
             final KeyLockRequest request = new KeyLockRequest();

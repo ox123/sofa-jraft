@@ -50,20 +50,20 @@ public class ProtobufMsgFactory {
 
     static {
         try {
-            FileDescriptorSet descriptorSet = FileDescriptorSet
-                    .parseFrom(ProtoBufFile.class.getResourceAsStream("/raft.desc"));
+            FileDescriptorSet descriptorSet = FileDescriptorSet.parseFrom(ProtoBufFile.class
+                .getResourceAsStream("/raft.desc"));
             List<FileDescriptor> resolveFDs = new ArrayList<>();
             for (FileDescriptorProto fdp : descriptorSet.getFileList()) {
 
-                FileDescriptor[] dpendencies = new FileDescriptor[resolveFDs.size()];
-                resolveFDs.toArray(dpendencies);
+                FileDescriptor[] dependencies = new FileDescriptor[resolveFDs.size()];
+                resolveFDs.toArray(dependencies);
 
-                FileDescriptor fd = FileDescriptor.buildFrom(fdp, dpendencies);
+                FileDescriptor fd = FileDescriptor.buildFrom(fdp, dependencies);
                 resolveFDs.add(fd);
                 for (Descriptor descriptor : fd.getMessageTypes()) {
 
                     String className = fdp.getOptions().getJavaPackage() + "."
-                            + fdp.getOptions().getJavaOuterClassname() + "$" + descriptor.getName();
+                                       + fdp.getOptions().getJavaOuterClassname() + "$" + descriptor.getName();
                     Class<?> clazz = Class.forName(className);
                     MethodHandle methodHandle = MethodHandles.lookup().findStatic(clazz, "parseFrom",
                         methodType(clazz, byte[].class));

@@ -37,6 +37,7 @@ import com.alipay.sofa.jraft.error.RaftError;
 import com.alipay.sofa.jraft.option.CopyOptions;
 import com.alipay.sofa.jraft.option.RaftOptions;
 import com.alipay.sofa.jraft.rpc.RaftClientService;
+import com.alipay.sofa.jraft.rpc.RpcRequests;
 import com.alipay.sofa.jraft.rpc.RpcRequests.GetFileRequest;
 import com.alipay.sofa.jraft.rpc.RpcRequests.GetFileResponse;
 import com.alipay.sofa.jraft.rpc.RpcResponseClosureAdapter;
@@ -57,43 +58,41 @@ import com.google.protobuf.Message;
 @ThreadSafe
 public class BoltSession implements Session {
 
-    private static final Logger          LOG  = LoggerFactory.getLogger(BoltSession.class);
+    private static final Logger          LOG         = LoggerFactory.getLogger(BoltSession.class);
 
-    private final Lock                   lock;
-    private final Status                 st;
+    private final Lock                   lock        = new ReentrantLock();
+    private final Status                 st          = Status.OK();
+    private final CountDownLatch         finishLatch = new CountDownLatch(1);
+    private final GetFileResponseClosure done        = new GetFileResponseClosure();
     private final RaftClientService      rpcService;
-    private int                          retryTimes;
-    private boolean                      finished;
-    private ByteBufferCollector          destBuf;
-    private CopyOptions                  copyOptions;
-    private GetFileRequest.Builder       requestBuilder;
-    private final CountDownLatch         finishLatch;
-    private OutputStream                 outputStream;
+    private final GetFileRequest.Builder requestBuilder;
     private final Endpoint               endpoint;
-    private final GetFileResponseClosure done = new GetFileResponseClosure();
-    private ScheduledFuture<?>           timer;
-    private String                       destPath;
-    private final RaftOptions            raftOptions;
-    private Future<Message>              rpcCall;
     private final TimerManager           timerManager;
     private final SnapshotThrottle       snapshotThrottle;
+    private final RaftOptions            raftOptions;
+    private int                          retryTimes  = 0;
+    private boolean                      finished;
+    private ByteBufferCollector          destBuf;
+    private CopyOptions                  copyOptions = new CopyOptions();
+    private OutputStream                 outputStream;
+    private ScheduledFuture<?>           timer;
+    private String                       destPath;
+    private Future<Message>              rpcCall;
 
     /**
      * Get file response closure to answer client.
-     * @author boyan (boyan@alibaba-inc.com)
      *
-     * 2018-Apr-13 4:50:21 PM
+     * @author boyan (boyan@alibaba-inc.com)
      */
     private class GetFileResponseClosure extends RpcResponseClosureAdapter<GetFileResponse> {
 
         @Override
-        public void run(Status status) {
+        public void run(final Status status) {
             onRpcReturned(status, getResponse());
         }
-
     }
 
-    public void setDestPath(String destPath) {
+    public void setDestPath(final String destPath) {
         this.destPath = destPath;
     }
 
@@ -114,48 +113,43 @@ public class BoltSession implements Session {
 
     @Override
     public void close() throws IOException {
-        lock.lock();
+        this.lock.lock();
         try {
             if (!this.finished) {
                 Utils.closeQuietly(this.outputStream);
             }
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 
-    public BoltSession(RaftClientService rpcService, TimerManager timerManager, SnapshotThrottle snapshotThrottle,
-                       RaftOptions raftOptions, GetFileRequest.Builder rb, Endpoint ep) {
+    public BoltSession(final RaftClientService rpcService, final TimerManager timerManager,
+                       final SnapshotThrottle snapshotThrottle, final RaftOptions raftOptions,
+                       final GetFileRequest.Builder rb, final Endpoint ep) {
         super();
         this.snapshotThrottle = snapshotThrottle;
         this.raftOptions = raftOptions;
         this.timerManager = timerManager;
         this.rpcService = rpcService;
         this.requestBuilder = rb;
-        this.retryTimes = 0;
-        this.copyOptions = new CopyOptions();
-        this.lock = new ReentrantLock();
         this.endpoint = ep;
-        this.st = Status.OK();
-        this.finishLatch = new CountDownLatch(1);
-
     }
 
-    public void setDestBuf(ByteBufferCollector bufRef) {
+    public void setDestBuf(final ByteBufferCollector bufRef) {
         this.destBuf = bufRef;
     }
 
-    public void setCopyOptions(CopyOptions copyOptions) {
+    public void setCopyOptions(final CopyOptions copyOptions) {
         this.copyOptions = copyOptions;
     }
 
-    public void setOutputStream(OutputStream out) {
+    public void setOutputStream(final OutputStream out) {
         this.outputStream = out;
     }
 
     @Override
     public void cancel() {
-        lock.lock();
+        this.lock.lock();
         try {
             if (this.finished) {
                 return;
@@ -166,15 +160,13 @@ public class BoltSession implements Session {
             if (this.rpcCall != null) {
                 this.rpcCall.cancel(true);
             }
-            if (st.isOk()) {
-                st.setError(RaftError.ECANCELED, RaftError.ECANCELED.name());
+            if (this.st.isOk()) {
+                this.st.setError(RaftError.ECANCELED, RaftError.ECANCELED.name());
             }
-
-            this.onFinished();
+            onFinished();
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
-
     }
 
     @Override
@@ -184,12 +176,17 @@ public class BoltSession implements Session {
 
     @Override
     public Status status() {
-        return st;
+        return this.st;
     }
 
     private void onFinished() {
         if (!this.finished) {
-            if (outputStream != null) {
+            if (!this.st.isOk()) {
+                LOG.error("Fail to copy data, readerId={} fileName={} offset={} status={}",
+                    this.requestBuilder.getReaderId(), this.requestBuilder.getFilename(),
+                    this.requestBuilder.getOffset(), this.st);
+            }
+            if (this.outputStream != null) {
                 Utils.closeQuietly(this.outputStream);
                 this.outputStream = null;
             }
@@ -209,96 +206,96 @@ public class BoltSession implements Session {
         Utils.runInThread(this::sendNextRpc);
     }
 
-    void onRpcReturned(Status status, GetFileResponse response) {
-        lock.lock();
+    void onRpcReturned(final Status status, final GetFileResponse response) {
+        this.lock.lock();
         try {
             if (this.finished) {
                 return;
             }
             if (!status.isOk()) {
                 // Reset count to make next rpc retry the previous one
-                requestBuilder.setCount(0);
+                this.requestBuilder.setCount(0);
                 if (status.getCode() == RaftError.ECANCELED.getNumber()) {
-                    if (st.isOk()) {
-                        st.setError(status.getCode(), status.getErrorMsg());
-                        this.onFinished();
+                    if (this.st.isOk()) {
+                        this.st.setError(status.getCode(), status.getErrorMsg());
+                        onFinished();
                         return;
                     }
                 }
 
                 // Throttled reading failure does not increase _retry_times
                 if (status.getCode() != RaftError.EAGAIN.getNumber()
-                    && ++this.retryTimes >= this.copyOptions.getMaxRetry()) {
-                    if (st.isOk()) {
-                        st.setError(status.getCode(), status.getErrorMsg());
-                        this.onFinished();
+                        && ++this.retryTimes >= this.copyOptions.getMaxRetry()) {
+                    if (this.st.isOk()) {
+                        this.st.setError(status.getCode(), status.getErrorMsg());
+                        onFinished();
                         return;
                     }
                 }
                 this.timer = this.timerManager.schedule(this::onTimer, this.copyOptions.getRetryIntervalMs(),
-                        TimeUnit.MILLISECONDS);
+                    TimeUnit.MILLISECONDS);
                 return;
             }
             this.retryTimes = 0;
             Requires.requireNonNull(response, "response");
             // Reset count to |real_read_size| to make next rpc get the right offset
-            if (response.hasReadSize() && response.getReadSize() != 0) {
+            if (!response.getEof()) {
                 this.requestBuilder.setCount(response.getReadSize());
             }
-            if (outputStream != null) {
+            if (this.outputStream != null) {
                 try {
-                    response.getData().writeTo(outputStream);
+                    response.getData().writeTo(this.outputStream);
                 } catch (final IOException e) {
                     LOG.error("Fail to write into file {}", this.destPath);
-                    st.setError(RaftError.EIO, RaftError.EIO.name());
-                    this.onFinished();
+                    this.st.setError(RaftError.EIO, RaftError.EIO.name());
+                    onFinished();
                     return;
                 }
             } else {
-                final byte[] data = response.getData().toByteArray();
-                this.destBuf.put(data);
+                this.destBuf.put(response.getData().asReadOnlyByteBuffer());
             }
             if (response.getEof()) {
                 onFinished();
                 return;
             }
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
-        this.sendNextRpc();
+        sendNextRpc();
     }
 
     /**
      * Send next RPC request to get a piece of file data.
      */
     void sendNextRpc() {
-        this.timer = null;
-        final long offset = requestBuilder.getOffset() + requestBuilder.getCount();
-        final long maxCount = this.destBuf == null ? raftOptions.getMaxByteCountPerRpc() : Integer.MAX_VALUE;
-        this.requestBuilder = requestBuilder.setOffset(offset).setCount(maxCount).setReadPartly(true);
         this.lock.lock();
         try {
+            this.timer = null;
+            final long offset = this.requestBuilder.getOffset() + this.requestBuilder.getCount();
+            final long maxCount = this.destBuf == null ? this.raftOptions.getMaxByteCountPerRpc() : Integer.MAX_VALUE;
+            this.requestBuilder.setOffset(offset).setCount(maxCount).setReadPartly(true);
+
             if (this.finished) {
                 return;
             }
             // throttle
             long newMaxCount = maxCount;
             if (this.snapshotThrottle != null) {
-                newMaxCount = snapshotThrottle.throttledByThroughput(maxCount);
+                newMaxCount = this.snapshotThrottle.throttledByThroughput(maxCount);
                 if (newMaxCount == 0) {
                     // Reset count to make next rpc retry the previous one
                     this.requestBuilder.setCount(0);
                     this.timer = this.timerManager.schedule(this::onTimer, this.copyOptions.getRetryIntervalMs(),
-                            TimeUnit.MILLISECONDS);
+                        TimeUnit.MILLISECONDS);
                     return;
                 }
             }
             this.requestBuilder.setCount(newMaxCount);
-            LOG.debug("Send get file request {} to peer {}", this.requestBuilder.build(), this.endpoint);
-            this.rpcCall = this.rpcService.getFile(endpoint, this.requestBuilder.build(),
-                this.copyOptions.getTimeoutMs(), done);
+            final RpcRequests.GetFileRequest request = this.requestBuilder.build();
+            LOG.debug("Send get file request {} to peer {}", request, this.endpoint);
+            this.rpcCall = this.rpcService.getFile(this.endpoint, request, this.copyOptions.getTimeoutMs(), this.done);
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 }

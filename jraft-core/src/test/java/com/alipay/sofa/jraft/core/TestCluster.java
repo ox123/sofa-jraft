@@ -31,11 +31,13 @@ import java.util.stream.Collectors;
 import org.apache.commons.io.FileUtils;
 
 import com.alipay.remoting.rpc.RpcServer;
+import com.alipay.sofa.jraft.JRaftServiceFactory;
 import com.alipay.sofa.jraft.Node;
 import com.alipay.sofa.jraft.RaftGroupService;
 import com.alipay.sofa.jraft.conf.Configuration;
 import com.alipay.sofa.jraft.entity.PeerId;
 import com.alipay.sofa.jraft.option.NodeOptions;
+import com.alipay.sofa.jraft.option.RaftOptions;
 import com.alipay.sofa.jraft.rpc.RaftRpcServerFactory;
 import com.alipay.sofa.jraft.storage.SnapshotThrottle;
 import com.alipay.sofa.jraft.util.Endpoint;
@@ -48,23 +50,33 @@ import com.alipay.sofa.jraft.util.Endpoint;
  */
 public class TestCluster {
     private final String                                  dataPath;
-    private final String                                  name; // groupId
+    private final String                                  name;                                                 // groupId
     private final List<PeerId>                            peers;
     private final List<NodeImpl>                          nodes;
     private final List<MockStateMachine>                  fsms;
-    private final ConcurrentMap<String, RaftGroupService> serverMap = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, RaftGroupService> serverMap          = new ConcurrentHashMap<>();
     private final int                                     electionTimeoutMs;
-    private final Lock                                    lock      = new ReentrantLock();
+    private final Lock                                    lock               = new ReentrantLock();
+
+    private JRaftServiceFactory                           raftServiceFactory = new DefaultJRaftServiceFactory();
+
+    public JRaftServiceFactory getRaftServiceFactory() {
+        return this.raftServiceFactory;
+    }
+
+    public void setRaftServiceFactory(final JRaftServiceFactory raftServiceFactory) {
+        this.raftServiceFactory = raftServiceFactory;
+    }
 
     public List<PeerId> getPeers() {
         return this.peers;
     }
 
-    public TestCluster(String name, String dataPath, List<PeerId> peers) {
+    public TestCluster(final String name, final String dataPath, final List<PeerId> peers) {
         this(name, dataPath, peers, 300);
     }
 
-    public TestCluster(String name, String dataPath, List<PeerId> peers, int electionTimeoutMs) {
+    public TestCluster(final String name, final String dataPath, final List<PeerId> peers, final int electionTimeoutMs) {
         super();
         this.name = name;
         this.dataPath = dataPath;
@@ -74,21 +86,28 @@ public class TestCluster {
         this.electionTimeoutMs = electionTimeoutMs;
     }
 
-    public boolean start(Endpoint addr) throws Exception {
+    public boolean start(final Endpoint addr) throws Exception {
         return this.start(addr, false, 300);
     }
 
-    public boolean start(Endpoint listenAddr, boolean emptyPeers, int snapshotIntervalSecs) throws IOException {
+    public boolean start(final Endpoint listenAddr, final boolean emptyPeers, final int snapshotIntervalSecs)
+                                                                                                             throws IOException {
         return this.start(listenAddr, emptyPeers, snapshotIntervalSecs, false);
     }
 
-    public boolean start(Endpoint listenAddr, boolean emptyPeers, int snapshotIntervalSecs,
-                         boolean enableMetrics) throws IOException {
-        return this.start(listenAddr, emptyPeers, snapshotIntervalSecs, enableMetrics, null);
+    public boolean start(final Endpoint listenAddr, final boolean emptyPeers, final int snapshotIntervalSecs,
+                         final boolean enableMetrics) throws IOException {
+        return this.start(listenAddr, emptyPeers, snapshotIntervalSecs, enableMetrics, null, null);
     }
 
-    public boolean start(Endpoint listenAddr, boolean emptyPeers, int snapshotIntervalSecs,
-                         boolean enableMetrics, SnapshotThrottle snapshotThrottle) throws IOException {
+    public boolean start(final Endpoint listenAddr, final boolean emptyPeers, final int snapshotIntervalSecs,
+                         final boolean enableMetrics, final SnapshotThrottle snapshotThrottle) throws IOException {
+        return this.start(listenAddr, emptyPeers, snapshotIntervalSecs, enableMetrics, snapshotThrottle, null);
+    }
+
+    public boolean start(final Endpoint listenAddr, final boolean emptyPeers, final int snapshotIntervalSecs,
+                         final boolean enableMetrics, final SnapshotThrottle snapshotThrottle,
+                         final RaftOptions raftOptions) throws IOException {
 
         if (this.serverMap.get(listenAddr.toString()) != null) {
             return true;
@@ -99,7 +118,11 @@ public class TestCluster {
         nodeOptions.setEnableMetrics(enableMetrics);
         nodeOptions.setSnapshotThrottle(snapshotThrottle);
         nodeOptions.setSnapshotIntervalSecs(snapshotIntervalSecs);
-        final String serverDataPath = this.dataPath + File.separator + listenAddr.toString();
+        nodeOptions.setServiceFactory(this.raftServiceFactory);
+        if (raftOptions != null) {
+            nodeOptions.setRaftOptions(raftOptions);
+        }
+        final String serverDataPath = this.dataPath + File.separator + listenAddr.toString().replace(':', '_');
         FileUtils.forceMkdir(new File(serverDataPath));
         nodeOptions.setLogUri(serverDataPath + File.separator + "logs");
         nodeOptions.setRaftMetaUri(serverDataPath + File.separator + "meta");
@@ -112,9 +135,10 @@ public class TestCluster {
         }
 
         final RpcServer rpcServer = RaftRpcServerFactory.createRaftRpcServer(listenAddr);
-        final RaftGroupService server = new RaftGroupService(this.name, new PeerId(listenAddr, 0), nodeOptions, rpcServer);
+        final RaftGroupService server = new RaftGroupService(this.name, new PeerId(listenAddr, 0), nodeOptions,
+            rpcServer);
 
-        lock.lock();
+        this.lock.lock();
         try {
             if (this.serverMap.put(listenAddr.toString(), server) == null) {
                 final Node node = server.start();
@@ -124,22 +148,22 @@ public class TestCluster {
                 return true;
             }
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
         return false;
     }
 
     public List<MockStateMachine> getFsms() {
-        lock.lock();
+        this.lock.lock();
         try {
             return new ArrayList<>(this.fsms);
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 
-    public boolean stop(Endpoint listenAddr) throws InterruptedException {
-        final Node node = this.removeNode(listenAddr);
+    public boolean stop(final Endpoint listenAddr) throws InterruptedException {
+        final Node node = removeNode(listenAddr);
         final CountDownLatch latch = new CountDownLatch(1);
         if (node != null) {
             node.shutdown(new ExpectClosure(latch));
@@ -153,36 +177,37 @@ public class TestCluster {
     }
 
     public void stopAll() throws InterruptedException {
-        final List<Endpoint> addrs = this.getAllNodes();
+        final List<Endpoint> addrs = getAllNodes();
         final List<Node> nodes = new ArrayList<>();
         for (final Endpoint addr : addrs) {
             final Node node = removeNode(addr);
             node.shutdown();
             nodes.add(node);
-            serverMap.remove(addr.toString()).shutdown();
+            this.serverMap.remove(addr.toString()).shutdown();
         }
         for (final Node node : nodes) {
             node.join();
         }
     }
 
-    public void clean(Endpoint listenAddr) throws IOException {
-        System.out.println("Clean dir:" + (this.dataPath + File.separator + listenAddr.toString()));
-        FileUtils.deleteDirectory(new File(this.dataPath + File.separator + listenAddr.toString()));
+    public void clean(final Endpoint listenAddr) throws IOException {
+        final String path = this.dataPath + File.separator + listenAddr.toString().replace(':', '_');
+        System.out.println("Clean dir:" + path);
+        FileUtils.deleteDirectory(new File(path));
     }
 
     public Node getLeader() {
-        lock.lock();
+        this.lock.lock();
         try {
-            for (int i = 0; i < nodes.size(); i++) {
-                final NodeImpl node = nodes.get(i);
-                if (node.isLeader() && fsms.get(i).getLeaderTerm() == node.getCurrentTerm()) {
+            for (int i = 0; i < this.nodes.size(); i++) {
+                final NodeImpl node = this.nodes.get(i);
+                if (node.isLeader() && this.fsms.get(i).getLeaderTerm() == node.getCurrentTerm()) {
                     return node;
                 }
             }
             return null;
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 
@@ -207,7 +232,7 @@ public class TestCluster {
 
     public List<Node> getFollowers() {
         final List<Node> ret = new ArrayList<>();
-        lock.lock();
+        this.lock.lock();
         try {
             for (final NodeImpl node : this.nodes) {
                 if (!node.isLeader()) {
@@ -215,7 +240,7 @@ public class TestCluster {
                 }
             }
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
         return ret;
     }
@@ -225,55 +250,55 @@ public class TestCluster {
      * @param expectAddr expected address
      * @throws InterruptedException if interrupted
      */
-    public void ensureLeader(Endpoint expectAddr) throws InterruptedException {
+    public void ensureLeader(final Endpoint expectAddr) throws InterruptedException {
         while (true) {
-            lock.lock();
+            this.lock.lock();
             for (final Node node : this.nodes) {
                 final PeerId leaderId = node.getLeaderId();
                 if (!leaderId.getEndpoint().equals(expectAddr)) {
-                    lock.unlock();
+                    this.lock.unlock();
                     Thread.sleep(10);
                     continue;
                 }
             }
             // all is ready
-            lock.unlock();
+            this.lock.unlock();
             return;
         }
     }
 
     public List<NodeImpl> getNodes() {
-        lock.lock();
+        this.lock.lock();
         try {
             return new ArrayList<>(this.nodes);
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 
     public List<Endpoint> getAllNodes() {
-        lock.lock();
+        this.lock.lock();
         try {
             return this.nodes.stream().map(node -> node.getNodeId().getPeerId().getEndpoint())
                     .collect(Collectors.toList());
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 
-    public Node removeNode(Endpoint addr) {
+    public Node removeNode(final Endpoint addr) {
         Node ret = null;
-        lock.lock();
+        this.lock.lock();
         try {
-            for (int i = 0; i < nodes.size(); i++) {
-                if (nodes.get(i).getNodeId().getPeerId().getEndpoint().equals(addr)) {
-                    ret = nodes.remove(i);
-                    fsms.remove(i);
+            for (int i = 0; i < this.nodes.size(); i++) {
+                if (this.nodes.get(i).getNodeId().getPeerId().getEndpoint().equals(addr)) {
+                    ret = this.nodes.remove(i);
+                    this.fsms.remove(i);
                     break;
                 }
             }
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
         return ret;
     }
@@ -288,15 +313,15 @@ public class TestCluster {
      * @return
      * @throws InterruptedException
      */
-    public boolean ensureSame(int waitTimes) throws InterruptedException {
-        lock.lock();
-        if (fsms.size() <= 1) {
-            lock.unlock();
+    public boolean ensureSame(final int waitTimes) throws InterruptedException {
+        this.lock.lock();
+        if (this.fsms.size() <= 1) {
+            this.lock.unlock();
             return true;
         }
         try {
             int nround = 0;
-            final MockStateMachine first = fsms.get(0);
+            final MockStateMachine first = this.fsms.get(0);
             CHECK: while (true) {
                 first.lock();
                 if (first.getLogs().isEmpty()) {
@@ -309,8 +334,8 @@ public class TestCluster {
                     continue CHECK;
                 }
 
-                for (int i = 1; i < fsms.size(); i++) {
-                    final MockStateMachine fsm = fsms.get(i);
+                for (int i = 1; i < this.fsms.size(); i++) {
+                    final MockStateMachine fsm = this.fsms.get(i);
                     fsm.lock();
                     if (fsm.getLogs().size() != first.getLogs().size()) {
                         fsm.unlock();
@@ -344,7 +369,7 @@ public class TestCluster {
             }
             return true;
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 }

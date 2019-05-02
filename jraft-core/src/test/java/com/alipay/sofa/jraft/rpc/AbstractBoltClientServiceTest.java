@@ -29,6 +29,7 @@ import org.mockito.Mockito;
 import org.mockito.runners.MockitoJUnitRunner;
 
 import com.alipay.remoting.InvokeCallback;
+import com.alipay.remoting.InvokeContext;
 import com.alipay.remoting.Url;
 import com.alipay.remoting.exception.RemotingException;
 import com.alipay.remoting.rpc.RpcClient;
@@ -39,7 +40,7 @@ import com.alipay.sofa.jraft.option.RpcOptions;
 import com.alipay.sofa.jraft.rpc.RpcRequests.ErrorResponse;
 import com.alipay.sofa.jraft.rpc.RpcRequests.PingRequest;
 import com.alipay.sofa.jraft.rpc.impl.AbstractBoltClientService;
-import com.alipay.sofa.jraft.rpc.impl.core.JraftRpcAddressParser;
+import com.alipay.sofa.jraft.rpc.impl.core.JRaftRpcAddressParser;
 import com.alipay.sofa.jraft.test.TestUtils;
 import com.alipay.sofa.jraft.util.Endpoint;
 import com.google.protobuf.Message;
@@ -65,7 +66,7 @@ public class AbstractBoltClientServiceTest {
     private MockBoltClientService clientService;
     @Mock
     private RpcClient             rpcClient;
-    private JraftRpcAddressParser rpcAddressParser = new JraftRpcAddressParser();
+    private JRaftRpcAddressParser rpcAddressParser = new JRaftRpcAddressParser();
     private Endpoint              endpoint         = new Endpoint("localhost", 8081);
 
     @Before
@@ -80,7 +81,7 @@ public class AbstractBoltClientServiceTest {
     @Test
     public void testConnect() throws Exception {
         Mockito.when(
-            this.rpcClient.invokeSync(eq(endpoint.toString()), Mockito.any(),
+            this.rpcClient.invokeSync(eq(endpoint.toString()), Mockito.any(), Mockito.any(),
                 eq(this.rpcOptions.getRpcConnectTimeoutMs()))).thenReturn(RpcResponseFactory.newResponse(Status.OK()));
         assertTrue(this.clientService.connect(this.endpoint));
     }
@@ -88,7 +89,7 @@ public class AbstractBoltClientServiceTest {
     @Test
     public void testConnectFailure() throws Exception {
         Mockito.when(
-            this.rpcClient.invokeSync(eq(endpoint.toString()), Mockito.any(),
+            this.rpcClient.invokeSync(eq(endpoint.toString()), Mockito.any(), Mockito.any(),
                 eq(this.rpcOptions.getRpcConnectTimeoutMs()))).thenReturn(
             RpcResponseFactory.newResponse(new Status(-1, "test")));
         assertFalse(this.clientService.connect(this.endpoint));
@@ -97,7 +98,7 @@ public class AbstractBoltClientServiceTest {
     @Test
     public void testConnectException() throws Exception {
         Mockito.when(
-            this.rpcClient.invokeSync(eq(endpoint.toString()), Mockito.any(),
+            this.rpcClient.invokeSync(eq(endpoint.toString()), Mockito.any(), Mockito.any(),
                 eq(this.rpcOptions.getRpcConnectTimeoutMs()))).thenThrow(new RemotingException("test"));
         assertFalse(this.clientService.connect(this.endpoint));
     }
@@ -130,7 +131,7 @@ public class AbstractBoltClientServiceTest {
         MockRpcResponseClosure<ErrorResponse> done = new MockRpcResponseClosure<>();
         Future<Message> future = this.clientService.invokeWithDone(this.endpoint, request, done, -1);
         Url rpcUrl = this.rpcAddressParser.parse(this.endpoint.toString());
-        Mockito.verify(this.rpcClient).invokeWithCallback(eq(rpcUrl), eq(request),
+        Mockito.verify(this.rpcClient).invokeWithCallback(eq(rpcUrl), eq(request), Mockito.any(),
             callbackArg.capture(), eq(this.rpcOptions.getRpcDefaultTimeout()));
         InvokeCallback cb = callbackArg.getValue();
         assertNotNull(cb);
@@ -155,15 +156,20 @@ public class AbstractBoltClientServiceTest {
 
     @Test
     public void testInvokeWithDoneException() throws Exception {
+        InvokeContext invokeCtx = new InvokeContext();
+        invokeCtx.put(InvokeContext.BOLT_CRC_SWITCH, false);
         ArgumentCaptor<InvokeCallback> callbackArg = ArgumentCaptor.forClass(InvokeCallback.class);
         PingRequest request = TestUtils.createPingRequest();
 
         Url rpcUrl = this.rpcAddressParser.parse(this.endpoint.toString());
-        Mockito.doThrow(new RemotingException()).when(this.rpcClient).invokeWithCallback(eq(rpcUrl),
-            eq(request), callbackArg.capture(), eq(this.rpcOptions.getRpcDefaultTimeout()));
+        Mockito
+            .doThrow(new RemotingException())
+            .when(this.rpcClient)
+            .invokeWithCallback(eq(rpcUrl), eq(request), eq(invokeCtx), callbackArg.capture(),
+                eq(this.rpcOptions.getRpcDefaultTimeout()));
 
         MockRpcResponseClosure<ErrorResponse> done = new MockRpcResponseClosure<>();
-        Future<Message> future = this.clientService.invokeWithDone(this.endpoint, request, done, -1);
+        Future<Message> future = this.clientService.invokeWithDone(this.endpoint, request, invokeCtx, done, -1);
         InvokeCallback cb = callbackArg.getValue();
         assertNotNull(cb);
         assertNotNull(future);
@@ -184,13 +190,15 @@ public class AbstractBoltClientServiceTest {
 
     @Test
     public void testInvokeWithDoneOnException() throws Exception {
+        InvokeContext invokeCtx = new InvokeContext();
+        invokeCtx.put(InvokeContext.BOLT_CRC_SWITCH, false);
         ArgumentCaptor<InvokeCallback> callbackArg = ArgumentCaptor.forClass(InvokeCallback.class);
         PingRequest request = TestUtils.createPingRequest();
 
         MockRpcResponseClosure<ErrorResponse> done = new MockRpcResponseClosure<>();
-        Future<Message> future = this.clientService.invokeWithDone(this.endpoint, request, done, -1);
+        Future<Message> future = this.clientService.invokeWithDone(this.endpoint, request, invokeCtx, done, -1);
         Url rpcUrl = this.rpcAddressParser.parse(this.endpoint.toString());
-        Mockito.verify(this.rpcClient).invokeWithCallback(eq(rpcUrl), eq(request),
+        Mockito.verify(this.rpcClient).invokeWithCallback(eq(rpcUrl), eq(request), eq(invokeCtx),
             callbackArg.capture(), eq(this.rpcOptions.getRpcDefaultTimeout()));
         InvokeCallback cb = callbackArg.getValue();
         assertNotNull(cb);

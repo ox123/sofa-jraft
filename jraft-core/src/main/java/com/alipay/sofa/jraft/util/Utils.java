@@ -53,21 +53,32 @@ public class Utils {
     /**
      * Default jraft closure executor pool minimum size, CPUs by default.
      */
-    public static final int           MIN_CLOSURE_EXECUTOR_POOL_SIZE = Integer
-            .parseInt(System.getProperty("jraft.closure.threadpool.size.min", String.valueOf(cpus())));
+    public static final int           MIN_CLOSURE_EXECUTOR_POOL_SIZE = Integer.parseInt(System.getProperty(
+                                                                         "jraft.closure.threadpool.size.min",
+                                                                         String.valueOf(cpus())));
 
     /**
      * Default jraft closure executor pool maximum size, 5*CPUs by default.
      */
-    public static final int           MAX_CLOSURE_EXECUTOR_POOL_SIZE = Integer
-            .parseInt(System.getProperty("jraft.closure.threadpool.size.max", String.valueOf(cpus() * 100)));
+    public static final int           MAX_CLOSURE_EXECUTOR_POOL_SIZE = Integer.parseInt(System.getProperty(
+                                                                         "jraft.closure.threadpool.size.max",
+                                                                         String.valueOf(cpus() * 100)));
 
     /**
      * Global thread pool to run closure.
      */
-    private static ThreadPoolExecutor CLOSURE_EXECUTOR               = ThreadPoolUtil.newThreadPool("CLOSURE_EXECUTOR",
-            true, MIN_CLOSURE_EXECUTOR_POOL_SIZE, MAX_CLOSURE_EXECUTOR_POOL_SIZE, 60L, new SynchronousQueue<>(),
-            new NamedThreadFactory("JRaft-Closure-Executor-", true));
+    private static ThreadPoolExecutor CLOSURE_EXECUTOR               = ThreadPoolUtil
+                                                                         .newBuilder()
+                                                                         .poolName("JRAFT_CLOSURE_EXECUTOR")
+                                                                         .enableMetric(true)
+                                                                         .coreThreads(MIN_CLOSURE_EXECUTOR_POOL_SIZE)
+                                                                         .maximumThreads(MAX_CLOSURE_EXECUTOR_POOL_SIZE)
+                                                                         .keepAliveSeconds(60L)
+                                                                         .workQueue(new SynchronousQueue<>())
+                                                                         .threadFactory(
+                                                                             new NamedThreadFactory(
+                                                                                 "JRaft-Closure-Executor-", true))
+                                                                         .build();
 
     private static final Pattern      GROUP_ID_PATTER                = Pattern.compile("^[a-zA-Z][a-zA-Z0-9\\-_]*$");
 
@@ -93,6 +104,9 @@ public class Utils {
      * Run closure with OK status in thread pool.
      */
     public static Future<?> runClosureInThread(final Closure done) {
+        if (done == null) {
+            return null;
+        }
         return runClosureInThread(done, Status.OK());
     }
 
@@ -167,7 +181,7 @@ public class Utils {
     }
 
     /**
-     * Default init and expand buffer size, it can be set by -Draft.byte_buf.size=n, default 1024.
+     * Default init and expand buffer size, it can be set by -Djraft.byte_buf.size=n, default 1024.
      */
     public static final int RAFT_DATA_BUF_SIZE = Integer.parseInt(System.getProperty("jraft.byte_buf.size", "1024"));
 

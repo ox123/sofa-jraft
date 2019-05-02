@@ -2,13 +2,20 @@ language: java
 sudo: false
 
 jdk:
-  - oraclejdk8
+  - openjdk8
+
+env:
+  - TESTFOLDER=jraft-core
+  - TESTFOLDER=jraft-rheakv/rheakv-core
+  - TESTFOLDER=jraft-rheakv/rheakv-pd
+
+cache:
+  directories:
+  - $HOME/.m2
 
 install:
   - mvn clean install -DskipTests=true -Dmaven.javadoc.skip=true -B -V
+  - travis_retry mvn --projects $TESTFOLDER clean test
 
 script:
-  - sh ./.middleware-common/check_format.sh
-
-after_success:
-  - travis_retry mvn clean test
+  - sh ./tools/check_format.sh
