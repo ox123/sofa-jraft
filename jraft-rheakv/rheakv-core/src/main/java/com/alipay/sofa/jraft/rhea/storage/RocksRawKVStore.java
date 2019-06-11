@@ -19,7 +19,6 @@ package com.alipay.sofa.jraft.rhea.storage;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Paths;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumMap;
@@ -154,10 +153,10 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
             this.cfDescriptors.add(new ColumnFamilyDescriptor(BytesUtil.writeUtf8("RHEA_FENCING"), cfOptions));
             this.writeOptions = new WriteOptions();
             this.writeOptions.setSync(opts.isSync());
-            this.writeOptions.setDisableWAL(false);
+            this.writeOptions.setDisableWAL(opts.isDisableWAL());
             // Delete existing data, relying on raft's snapshot and log playback
             // to reply to the data is the correct behavior.
-            FileUtils.deleteDirectory(new File(opts.getDbPath()));
+            destroyRocksDB(opts);
             openRocksDB(opts);
             LOG.info("[RocksRawKVStore] start successfully, options: {}.", opts);
             return true;
@@ -245,7 +244,7 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
             final byte[] value = this.db.get(key);
             setSuccess(closure, value);
         } catch (final Exception e) {
-            LOG.error("Fail to [GET], key: [{}], {}.", Arrays.toString(key), StackTraceUtil.stackTrace(e));
+            LOG.error("Fail to [GET], key: [{}], {}.", BytesUtil.toHex(key), StackTraceUtil.stackTrace(e));
             setFailure(closure, "Fail to [GET]");
         } finally {
             readLock.unlock();
@@ -277,7 +276,8 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
 
     @Override
     public void scan(final byte[] startKey, final byte[] endKey, final int limit,
-                     @SuppressWarnings("unused") final boolean readOnlySafe, final KVStoreClosure closure) {
+                     @SuppressWarnings("unused") final boolean readOnlySafe, final boolean returnValue,
+                     final KVStoreClosure closure) {
         final Timer.Context timeCtx = getTimeContext("SCAN");
         final List<KVEntry> entries = Lists.newArrayList();
         // If limit == 0, it will be modified to Integer.MAX_VALUE on the server
@@ -300,12 +300,12 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
                 if (endKey != null && BytesUtil.compare(key, endKey) >= 0) {
                     break;
                 }
-                entries.add(new KVEntry(key, it.value()));
+                entries.add(new KVEntry(key, returnValue ? it.value() : null));
                 it.next();
             }
             setSuccess(closure, entries);
         } catch (final Exception e) {
-            LOG.error("Fail to [SCAN], range: ['[{}, {})'], {}.", Arrays.toString(startKey), Arrays.toString(endKey),
+            LOG.error("Fail to [SCAN], range: ['[{}, {})'], {}.", BytesUtil.toHex(startKey), BytesUtil.toHex(endKey),
                 StackTraceUtil.stackTrace(e));
             setFailure(closure, "Fail to [SCAN]");
         } finally {
@@ -344,9 +344,9 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
             }
             setSuccess(closure, new Sequence(startVal, endVal));
         } catch (final Exception e) {
-            LOG.error("Fail to [GET_SEQUENCE], [key = {}, step = {}], {}.", Arrays.toString(seqKey), step,
+            LOG.error("Fail to [GET_SEQUENCE], [key = {}, step = {}], {}.", BytesUtil.toHex(seqKey), step,
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [GET_SEQUENCE]");
+            setCriticalError(closure, "Fail to [GET_SEQUENCE]", e);
         } finally {
             readLock.unlock();
             timeCtx.stop();
@@ -362,9 +362,9 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
             this.db.delete(this.sequenceHandle, seqKey);
             setSuccess(closure, Boolean.TRUE);
         } catch (final Exception e) {
-            LOG.error("Fail to [RESET_SEQUENCE], [key = {}], {}.", Arrays.toString(seqKey),
+            LOG.error("Fail to [RESET_SEQUENCE], [key = {}], {}.", BytesUtil.toHex(seqKey),
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [RESET_SEQUENCE]");
+            setCriticalError(closure, "Fail to [RESET_SEQUENCE]", e);
         } finally {
             readLock.unlock();
             timeCtx.stop();
@@ -392,11 +392,9 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
                         setSuccess(kvState.getDone(), Boolean.TRUE);
                     }
                 } catch (final Exception e) {
-                    LOG.error("Failed to [BATCH_RESET_SEQUENCE],  [size = {}], {}.",
-                            segment.size(), StackTraceUtil.stackTrace(e));
-                    for (final KVState kvState : segment) {
-                        setFailure(kvState.getDone(), "Fail to [BATCH_RESET_SEQUENCE]");
-                    }
+                    LOG.error("Failed to [BATCH_RESET_SEQUENCE], [size = {}], {}.", segment.size(),
+                        StackTraceUtil.stackTrace(e));
+                    setCriticalError(Lists.transform(kvStates, KVState::getDone), "Fail to [BATCH_RESET_SEQUENCE]", e);
                 }
                 return null;
             });
@@ -415,9 +413,9 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
             this.db.put(this.writeOptions, key, value);
             setSuccess(closure, Boolean.TRUE);
         } catch (final Exception e) {
-            LOG.error("Fail to [PUT], [{}, {}], {}.", Arrays.toString(key), Arrays.toString(value),
+            LOG.error("Fail to [PUT], [{}, {}], {}.", BytesUtil.toHex(key), BytesUtil.toHex(value),
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [PUT]");
+            setCriticalError(closure, "Fail to [PUT]", e);
         } finally {
             readLock.unlock();
             timeCtx.stop();
@@ -447,11 +445,8 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
                         setSuccess(kvState.getDone(), Boolean.TRUE);
                     }
                 } catch (final Exception e) {
-                    LOG.error("Failed to [BATCH_PUT], [size = {}] {}.", segment.size(),
-                            StackTraceUtil.stackTrace(e));
-                    for (final KVState kvState : segment) {
-                        setFailure(kvState.getDone(), "Fail to [BATCH_PUT]");
-                    }
+                    LOG.error("Failed to [BATCH_PUT], [size = {}] {}.", segment.size(), StackTraceUtil.stackTrace(e));
+                    setCriticalError(Lists.transform(kvStates, KVState::getDone), "Fail to [BATCH_PUT]", e);
                 }
                 return null;
             });
@@ -471,9 +466,9 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
             this.db.put(this.writeOptions, key, value);
             setSuccess(closure, prevVal);
         } catch (final Exception e) {
-            LOG.error("Fail to [GET_PUT], [{}, {}], {}.", Arrays.toString(key), Arrays.toString(value),
+            LOG.error("Fail to [GET_PUT], [{}, {}], {}.", BytesUtil.toHex(key), BytesUtil.toHex(value),
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [GET_PUT]");
+            setCriticalError(closure, "Fail to [GET_PUT]", e);
         } finally {
             readLock.unlock();
             timeCtx.stop();
@@ -509,10 +504,8 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
                     }
                 } catch (final Exception e) {
                     LOG.error("Failed to [BATCH_GET_PUT], [size = {}] {}.", segment.size(),
-                            StackTraceUtil.stackTrace(e));
-                    for (final KVState kvState : segment) {
-                        setFailure(kvState.getDone(), "Fail to [BATCH_GET_PUT]");
-                    }
+                        StackTraceUtil.stackTrace(e));
+                    setCriticalError(Lists.transform(kvStates, KVState::getDone), "Fail to [BATCH_GET_PUT]", e);
                 }
                 return null;
             });
@@ -531,9 +524,9 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
             this.db.merge(this.writeOptions, key, value);
             setSuccess(closure, Boolean.TRUE);
         } catch (final Exception e) {
-            LOG.error("Fail to [MERGE], [{}, {}], {}.", Arrays.toString(key), Arrays.toString(value),
+            LOG.error("Fail to [MERGE], [{}, {}], {}.", BytesUtil.toHex(key), BytesUtil.toHex(value),
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [MERGE]");
+            setCriticalError(closure, "Fail to [MERGE]", e);
         } finally {
             readLock.unlock();
             timeCtx.stop();
@@ -563,11 +556,8 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
                         setSuccess(kvState.getDone(), Boolean.TRUE);
                     }
                 } catch (final Exception e) {
-                    LOG.error("Failed to [BATCH_MERGE], [size = {}] {}.", segment.size(),
-                            StackTraceUtil.stackTrace(e));
-                    for (final KVState kvState : segment) {
-                        setFailure(kvState.getDone(), "Fail to [BATCH_MERGE]");
-                    }
+                    LOG.error("Failed to [BATCH_MERGE], [size = {}] {}.", segment.size(), StackTraceUtil.stackTrace(e));
+                    setCriticalError(Lists.transform(kvStates, KVState::getDone), "Fail to [BATCH_MERGE]", e);
                 }
                 return null;
             });
@@ -590,7 +580,7 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
             setSuccess(closure, Boolean.TRUE);
         } catch (final Exception e) {
             LOG.error("Failed to [PUT_LIST], [size = {}], {}.", entries.size(), StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [PUT_LIST]");
+            setCriticalError(closure, "Fail to [PUT_LIST]", e);
         } finally {
             readLock.unlock();
             timeCtx.stop();
@@ -609,9 +599,9 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
             }
             setSuccess(closure, prevVal);
         } catch (final Exception e) {
-            LOG.error("Fail to [PUT_IF_ABSENT], [{}, {}], {}.", Arrays.toString(key), Arrays.toString(value),
+            LOG.error("Fail to [PUT_IF_ABSENT], [{}, {}], {}.", BytesUtil.toHex(key), BytesUtil.toHex(value),
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [PUT_IF_ABSENT]");
+            setCriticalError(closure, "Fail to [PUT_IF_ABSENT]", e);
         } finally {
             readLock.unlock();
             timeCtx.stop();
@@ -771,8 +761,8 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
 
             setSuccess(closure, owner);
         } catch (final Exception e) {
-            LOG.error("Fail to [TRY_LOCK], [{}, {}], {}.", Arrays.toString(key), acquirer, StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [TRY_LOCK]");
+            LOG.error("Fail to [TRY_LOCK], [{}, {}], {}.", BytesUtil.toHex(key), acquirer, StackTraceUtil.stackTrace(e));
+            setCriticalError(closure, "Fail to [TRY_LOCK]", e);
         } finally {
             readLock.unlock();
             timeCtx.stop();
@@ -850,8 +840,8 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
 
             setSuccess(closure, owner);
         } catch (final Exception e) {
-            LOG.error("Fail to [RELEASE_LOCK], [{}], {}.", Arrays.toString(key), StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [RELEASE_LOCK]");
+            LOG.error("Fail to [RELEASE_LOCK], [{}], {}.", BytesUtil.toHex(key), StackTraceUtil.stackTrace(e));
+            setCriticalError(closure, "Fail to [RELEASE_LOCK]", e);
         } finally {
             readLock.unlock();
             timeCtx.stop();
@@ -894,8 +884,8 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
             this.db.delete(this.writeOptions, key);
             setSuccess(closure, Boolean.TRUE);
         } catch (final Exception e) {
-            LOG.error("Fail to [DELETE], [{}], {}.", Arrays.toString(key), StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [DELETE]");
+            LOG.error("Fail to [DELETE], [{}], {}.", BytesUtil.toHex(key), StackTraceUtil.stackTrace(e));
+            setCriticalError(closure, "Fail to [DELETE]", e);
         } finally {
             readLock.unlock();
             timeCtx.stop();
@@ -923,11 +913,9 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
                         setSuccess(kvState.getDone(), Boolean.TRUE);
                     }
                 } catch (final Exception e) {
-                    LOG.error("Failed to [BATCH_DELETE],  [size = {}], {}.",
-                            segment.size(), StackTraceUtil.stackTrace(e));
-                    for (final KVState kvState : segment) {
-                        setFailure(kvState.getDone(), "Fail to [BATCH_DELETE]");
-                    }
+                    LOG.error("Failed to [BATCH_DELETE], [size = {}], {}.", segment.size(),
+                        StackTraceUtil.stackTrace(e));
+                    setCriticalError(Lists.transform(kvStates, KVState::getDone), "Fail to [BATCH_DELETE]", e);
                 }
                 return null;
             });
@@ -946,9 +934,9 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
             this.db.deleteRange(this.writeOptions, startKey, endKey);
             setSuccess(closure, Boolean.TRUE);
         } catch (final Exception e) {
-            LOG.error("Fail to [DELETE_RANGE], ['[{}, {})'], {}.", Arrays.toString(startKey), Arrays.toString(endKey),
+            LOG.error("Fail to [DELETE_RANGE], ['[{}, {})'], {}.", BytesUtil.toHex(startKey), BytesUtil.toHex(endKey),
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [DELETE_RANGE]");
+            setCriticalError(closure, "Fail to [DELETE_RANGE]", e);
         } finally {
             readLock.unlock();
             timeCtx.stop();
@@ -1331,6 +1319,17 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
         }
     }
 
+    private void destroyRocksDB(final RocksDBOptions opts) throws RocksDBException {
+        // The major difference with directly deleting the DB directory manually is that
+        // DestroyDB() will take care of the case where the RocksDB database is stored
+        // in multiple directories. For instance, a single DB can be configured to store
+        // its data in multiple directories by specifying different paths to
+        // DBOptions::db_paths, DBOptions::db_log_dir, and DBOptions::wal_dir.
+        try (final Options opt = new Options()) {
+            RocksDB.destroyDB(opts.getDbPath(), opt);
+        }
+    }
+
     // Creates the config for plain table sst format.
     private static BlockBasedTableConfig createTableConfig() {
         return new BlockBasedTableConfig() //
@@ -1352,16 +1351,16 @@ public class RocksRawKVStore extends BatchRawKVStore<RocksDBOptions> {
     // of a database.
     private static ColumnFamilyOptions createColumnFamilyOptions() {
         final BlockBasedTableConfig tConfig = createTableConfig();
-        final ColumnFamilyOptions opts = StorageOptionsFactory.getRocksDBColumnFamilyOptions(RocksRawKVStore.class);
-        opts.setTableFormatConfig(tConfig) //
+        return StorageOptionsFactory.getRocksDBColumnFamilyOptions(RocksRawKVStore.class) //
+            .setTableFormatConfig(tConfig) //
             .setMergeOperator(new StringAppendOperator());
-        return opts;
     }
 
     // Creates the backupable db options to control the behavior of
     // a backupable database.
     private static BackupableDBOptions createBackupDBOptions(final String backupDBPath) {
         return new BackupableDBOptions(backupDBPath) //
+            .setSync(true) //
             .setShareTableFiles(false); // don't share data between backups
     }
 }

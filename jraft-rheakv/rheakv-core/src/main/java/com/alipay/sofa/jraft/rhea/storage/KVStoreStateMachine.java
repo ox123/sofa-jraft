@@ -16,7 +16,7 @@
  */
 package com.alipay.sofa.jraft.rhea.storage;
 
-import java.util.Arrays;
+import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
@@ -38,10 +38,11 @@ import com.alipay.sofa.jraft.rhea.metadata.Region;
 import com.alipay.sofa.jraft.rhea.metrics.KVMetrics;
 import com.alipay.sofa.jraft.rhea.serialization.Serializer;
 import com.alipay.sofa.jraft.rhea.serialization.Serializers;
-import com.alipay.sofa.jraft.rhea.util.Pair;
-import com.alipay.sofa.jraft.rhea.util.RecycleUtil;
+import com.alipay.sofa.jraft.rhea.util.StackTraceUtil;
 import com.alipay.sofa.jraft.storage.snapshot.SnapshotReader;
 import com.alipay.sofa.jraft.storage.snapshot.SnapshotWriter;
+import com.alipay.sofa.jraft.util.BytesUtil;
+import com.alipay.sofa.jraft.util.RecycleUtil;
 import com.codahale.metrics.Histogram;
 import com.codahale.metrics.Meter;
 
@@ -79,45 +80,60 @@ public class KVStoreStateMachine extends StateMachineAdapter {
 
     @Override
     public void onApply(final Iterator it) {
-        int stCount = 0;
-        KVStateOutputList kvStates = KVStateOutputList.newInstance();
-        while (it.hasNext()) {
-            KVOperation kvOp;
-            final KVClosureAdapter done = (KVClosureAdapter) it.done();
-            if (done != null) {
-                kvOp = done.getOperation();
-            } else {
-                final byte[] data = it.getData().array();
-                try {
-                    kvOp = this.serializer.readObject(data, KVOperation.class);
-                } catch (final Throwable t) {
-                    throw new StoreCodecException("Decode operation error", t);
+        int index = 0;
+        int applied = 0;
+        try {
+            KVStateOutputList kvStates = KVStateOutputList.newInstance();
+            while (it.hasNext()) {
+                KVOperation kvOp;
+                final KVClosureAdapter done = (KVClosureAdapter) it.done();
+                if (done != null) {
+                    kvOp = done.getOperation();
+                } else {
+                    final ByteBuffer buf = it.getData();
+                    try {
+                        if (buf.hasArray()) {
+                            kvOp = this.serializer.readObject(buf.array(), KVOperation.class);
+                        } else {
+                            kvOp = this.serializer.readObject(buf, KVOperation.class);
+                        }
+                    } catch (final Throwable t) {
+                        ++index;
+                        throw new StoreCodecException("Decode operation error", t);
+                    }
                 }
+                final KVState first = kvStates.getFirstElement();
+                if (first != null && !first.isSameOp(kvOp)) {
+                    applied += batchApplyAndRecycle(first.getOpByte(), kvStates);
+                    kvStates = KVStateOutputList.newInstance();
+                }
+                kvStates.add(KVState.of(kvOp, done));
+                ++index;
+                it.next();
             }
-            final KVState first = kvStates.getFirstElement();
-            if (first != null && !first.isSameOp(kvOp)) {
-                batchApplyAndRecycle(first.getOpByte(), kvStates);
-                kvStates = KVStateOutputList.newInstance();
+            if (!kvStates.isEmpty()) {
+                final KVState first = kvStates.getFirstElement();
+                assert first != null;
+                applied += batchApplyAndRecycle(first.getOpByte(), kvStates);
             }
-            kvStates.add(KVState.of(kvOp, done));
-            ++stCount;
-            it.next();
+        } catch (final Throwable t) {
+            LOG.error("StateMachine meet critical error: {}.", StackTraceUtil.stackTrace(t));
+            it.setErrorAndRollback(index - applied, new Status(RaftError.ESTATEMACHINE,
+                "StateMachine meet critical error: %s.", t.getMessage()));
+        } finally {
+            // metrics: qps
+            this.applyMeter.mark(applied);
         }
-        if (!kvStates.isEmpty()) {
-            final KVState first = kvStates.getFirstElement();
-            assert first != null;
-            batchApplyAndRecycle(first.getOpByte(), kvStates);
-        }
-
-        // metrics: qps
-        this.applyMeter.mark(stCount);
     }
 
-    private void batchApplyAndRecycle(final byte opByte, final KVStateOutputList kvStates) {
+    private int batchApplyAndRecycle(final byte opByte, final KVStateOutputList kvStates) {
         try {
-            if (kvStates.isEmpty()) {
-                return;
+            final int size = kvStates.size();
+
+            if (size == 0) {
+                return 0;
             }
+
             if (!KVOperation.isValidOp(opByte)) {
                 throw new IllegalKVOperationException("Unknown operation: " + opByte);
             }
@@ -125,12 +141,13 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             // metrics: op qps
             final Meter opApplyMeter = KVMetrics.meter(STATE_MACHINE_APPLY_QPS, String.valueOf(this.region.getId()),
                 KVOperation.opName(opByte));
-            final int size = kvStates.size();
             opApplyMeter.mark(size);
             this.batchWriteHistogram.update(size);
 
             // do batch apply
             batchApply(opByte, kvStates);
+
+            return size;
         } finally {
             RecycleUtil.recycle(kvStates);
         }
@@ -195,15 +212,16 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         final byte[] parentKey = this.region.getStartKey();
         for (final KVState kvState : kvStates) {
             final KVOperation op = kvState.getOp();
-            final Pair<Long, Long> regionIds = op.getRegionIds();
+            final long currentRegionId = op.getCurrentRegionId();
+            final long newRegionId = op.getNewRegionId();
             final byte[] splitKey = op.getKey();
             final KVStoreClosure closure = kvState.getDone();
             try {
                 this.rawKVStore.initFencingToken(parentKey, splitKey);
-                this.storeEngine.doSplit(regionIds.getKey(), regionIds.getValue(), splitKey, closure);
+                this.storeEngine.doSplit(currentRegionId, newRegionId, splitKey, closure);
             } catch (final Exception e) {
-                LOG.error("Fail to split, regionId={}, newRegionId={}, splitKey={}.", regionIds.getKey(),
-                    regionIds.getValue(), Arrays.toString(splitKey));
+                LOG.error("Fail to split, regionId={}, newRegionId={}, splitKey={}.", currentRegionId, newRegionId,
+                    BytesUtil.toHex(splitKey));
                 if (closure != null) {
                     // closure is null on follower node
                     closure.setError(Errors.STORAGE_ERROR);

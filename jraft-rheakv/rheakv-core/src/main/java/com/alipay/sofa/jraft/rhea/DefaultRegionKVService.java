@@ -364,7 +364,7 @@ public class DefaultRegionKVService implements RegionKVService {
         try {
             KVParameterRequires.requireSameEpoch(request, getRegionEpoch());
             this.rawKVStore.scan(request.getStartKey(), request.getEndKey(), request.getLimit(),
-                request.isReadOnlySafe(), new BaseKVStoreClosure() {
+                request.isReadOnlySafe(), request.isReturnValue(), new BaseKVStoreClosure() {
 
                     @SuppressWarnings("unchecked")
                     @Override
@@ -565,7 +565,8 @@ public class DefaultRegionKVService implements RegionKVService {
 
     private static void setFailure(final BaseRequest request, final BaseResponse<?> response, final Status status,
                                    final Errors error) {
-        response.setError(error);
+        response.setError(error == null ? Errors.STORAGE_ERROR : error);
+        response.setErrorMsg(status.toString());
         LOG.error("Failed to handle: {}, status: {}, error: {}.", request, status, error);
     }
 }
