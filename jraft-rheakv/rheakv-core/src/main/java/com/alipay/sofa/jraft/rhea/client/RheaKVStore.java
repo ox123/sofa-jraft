@@ -407,6 +407,33 @@ public interface RheaKVStore extends Lifecycle<RheaKVStoreOptions> {
     byte[] bGetAndPut(final String key, final byte[] value);
 
     /**
+     * Atomically sets the value to the given updated value
+     * if the current value equal (compare bytes) the expected value.
+     *
+     * @param key    the key retrieve the value
+     * @param expect the expected value
+     * @param update the new value
+     * @return true if successful. False return indicates that the actual
+     * value was not equal to the expected value.
+     */
+    CompletableFuture<Boolean> compareAndPut(final byte[] key, final byte[] expect, final byte[] update);
+
+    /**
+     * @see #compareAndPut(byte[], byte[], byte[])
+     */
+    CompletableFuture<Boolean> compareAndPut(final String key, final byte[] expect, final byte[] update);
+
+    /**
+     * @see #compareAndPut(byte[], byte[], byte[])
+     */
+    Boolean bCompareAndPut(final byte[] key, final byte[] expect, final byte[] update);
+
+    /**
+     * @see #compareAndPut(byte[], byte[], byte[])
+     */
+    Boolean bCompareAndPut(final String key, final byte[] expect, final byte[] update);
+
+    /**
      * Add merge operand for key/value pair.
      *
      * <pre>
@@ -439,7 +466,7 @@ public interface RheaKVStore extends Lifecycle<RheaKVStoreOptions> {
     /**
      * @see #put(List)
      */
-    boolean bPut(final List<KVEntry> entries);
+    Boolean bPut(final List<KVEntry> entries);
 
     /**
      * If the specified key is not already associated with a value
@@ -511,12 +538,22 @@ public interface RheaKVStore extends Lifecycle<RheaKVStoreOptions> {
     /**
      * @see #deleteRange(byte[], byte[])
      */
-    boolean bDeleteRange(final byte[] startKey, final byte[] endKey);
+    Boolean bDeleteRange(final byte[] startKey, final byte[] endKey);
 
     /**
      * @see #deleteRange(byte[], byte[])
      */
-    boolean bDeleteRange(final String startKey, final String endKey);
+    Boolean bDeleteRange(final String startKey, final String endKey);
+
+    /**
+     * The batch method of {@link #delete(byte[])}
+     */
+    CompletableFuture<Boolean> delete(final List<byte[]> keys);
+
+    /**
+     * @see #delete(List)
+     */
+    Boolean bDelete(final List<byte[]> keys);
 
     /**
      * @see #getDistributedLock(byte[], long, TimeUnit, ScheduledExecutorService)

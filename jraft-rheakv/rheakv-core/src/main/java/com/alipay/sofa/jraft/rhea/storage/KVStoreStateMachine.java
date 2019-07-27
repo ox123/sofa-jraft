@@ -171,6 +171,9 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             case KVOperation.DELETE_RANGE:
                 this.rawKVStore.batchDeleteRange(kvStates);
                 break;
+            case KVOperation.DELETE_LIST:
+                this.rawKVStore.batchDeleteList(kvStates);
+                break;
             case KVOperation.GET_SEQUENCE:
                 this.rawKVStore.batchGetSequence(kvStates);
                 break;
@@ -194,6 +197,9 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                 break;
             case KVOperation.GET_PUT:
                 this.rawKVStore.batchGetAndPut(kvStates);
+                break;
+            case KVOperation.COMPARE_PUT:
+                this.rawKVStore.batchCompareAndPut(kvStates);
                 break;
             case KVOperation.MERGE:
                 this.rawKVStore.batchMerge(kvStates);

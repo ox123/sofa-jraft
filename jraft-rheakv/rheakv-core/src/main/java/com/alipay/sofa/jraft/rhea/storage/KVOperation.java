@@ -70,13 +70,17 @@ public class KVOperation implements Serializable {
     // split operation ***********************************
     /** Range split operation */
     public static final byte    RANGE_SPLIT      = 0x10;
+    /** Compare and put operation */
+    public static final byte    COMPARE_PUT      = 0x11;
+    /** Delete list operation */
+    public static final byte    DELETE_LIST      = 0x12;
 
-    public static final byte    EOF              = 0x11;
+    public static final byte    EOF              = 0x13;
 
     private static final byte[] VALID_OPS;
 
     static {
-        VALID_OPS = new byte[16];
+        VALID_OPS = new byte[18];
         VALID_OPS[0] = PUT;
         VALID_OPS[1] = PUT_IF_ABSENT;
         VALID_OPS[2] = DELETE;
@@ -93,6 +97,8 @@ public class KVOperation implements Serializable {
         VALID_OPS[13] = MERGE;
         VALID_OPS[14] = RESET_SEQUENCE;
         VALID_OPS[15] = RANGE_SPLIT;
+        VALID_OPS[16] = COMPARE_PUT;
+        VALID_OPS[17] = DELETE_LIST;
     }
 
     private byte[]              key;                                    // also startKey for DELETE_RANGE
@@ -144,6 +150,12 @@ public class KVOperation implements Serializable {
         return new KVOperation(startKey, endKey, null, DELETE_RANGE);
     }
 
+    public static KVOperation createDeleteList(final List<byte[]> keys) {
+        Requires.requireNonNull(keys, "keys");
+        Requires.requireTrue(!keys.isEmpty(), "keys is empty");
+        return new KVOperation(BytesUtil.EMPTY_BYTES, BytesUtil.EMPTY_BYTES, keys, DELETE_LIST);
+    }
+
     public static KVOperation createGetSequence(final byte[] seqKey, final int step) {
         Requires.requireNonNull(seqKey, "seqKey");
         Requires.requireTrue(step > 0, "step must > 0");
@@ -185,6 +197,13 @@ public class KVOperation implements Serializable {
         Requires.requireNonNull(key, "key");
         Requires.requireNonNull(value, "value");
         return new KVOperation(key, value, null, GET_PUT);
+    }
+
+    public static KVOperation createCompareAndPut(final byte[] key, final byte[] expect, final byte[] update) {
+        Requires.requireNonNull(key, "key");
+        Requires.requireNonNull(expect, "expect");
+        Requires.requireNonNull(update, "update");
+        return new KVOperation(key, update, expect, COMPARE_PUT);
     }
 
     public static KVOperation createMerge(final byte[] key, final byte[] value) {
@@ -237,17 +256,26 @@ public class KVOperation implements Serializable {
         return value;
     }
 
+    public byte getOp() {
+        return op;
+    }
+
     public int getStep() {
         return (Integer) this.attach;
     }
 
-    public byte getOp() {
-        return op;
+    public byte[] getExpect() {
+        return (byte[]) this.attach;
     }
 
     @SuppressWarnings("unchecked")
     public List<KVEntry> getEntries() {
         return (List<KVEntry>) this.attach;
+    }
+
+    @SuppressWarnings("unchecked")
+    public List<byte[]> getKeys() {
+        return (List<byte[]>) this.attach;
     }
 
     public NodeExecutor getNodeExecutor() {
@@ -320,6 +348,8 @@ public class KVOperation implements Serializable {
                 return "SCAN";
             case GET_PUT:
                 return "GET_PUT";
+            case COMPARE_PUT:
+                return "COMPARE_PUT";
             case MERGE:
                 return "MERGE";
             case RESET_SEQUENCE:

@@ -231,6 +231,11 @@ public class RaftRawKVStore implements RawKVStore {
     }
 
     @Override
+    public void compareAndPut(final byte[] key, final byte[] expect, final byte[] update, final KVStoreClosure closure) {
+        applyOperation(KVOperation.createCompareAndPut(key, expect, update), closure);
+    }
+
+    @Override
     public void merge(final byte[] key, final byte[] value, final KVStoreClosure closure) {
         applyOperation(KVOperation.createMerge(key, value), closure);
     }
@@ -269,6 +274,11 @@ public class RaftRawKVStore implements RawKVStore {
     @Override
     public void deleteRange(final byte[] startKey, final byte[] endKey, final KVStoreClosure closure) {
         applyOperation(KVOperation.createDeleteRange(startKey, endKey), closure);
+    }
+
+    @Override
+    public void delete(final List<byte[]> keys, final KVStoreClosure closure) {
+        applyOperation(KVOperation.createDeleteList(keys), closure);
     }
 
     @Override

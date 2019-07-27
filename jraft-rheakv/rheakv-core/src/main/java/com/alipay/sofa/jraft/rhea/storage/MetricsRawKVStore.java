@@ -23,8 +23,9 @@ import com.alipay.sofa.jraft.rhea.util.concurrent.DistributedLock;
 import com.codahale.metrics.Timer;
 
 import static com.alipay.sofa.jraft.rhea.metrics.KVMetricNames.RPC_REQUEST_HANDLE_TIMER;
-import static com.alipay.sofa.jraft.rhea.storage.KVOperation.PUT_LIST;
+import static com.alipay.sofa.jraft.rhea.storage.KVOperation.COMPARE_PUT;
 import static com.alipay.sofa.jraft.rhea.storage.KVOperation.DELETE;
+import static com.alipay.sofa.jraft.rhea.storage.KVOperation.DELETE_LIST;
 import static com.alipay.sofa.jraft.rhea.storage.KVOperation.DELETE_RANGE;
 import static com.alipay.sofa.jraft.rhea.storage.KVOperation.GET;
 import static com.alipay.sofa.jraft.rhea.storage.KVOperation.GET_PUT;
@@ -36,6 +37,7 @@ import static com.alipay.sofa.jraft.rhea.storage.KVOperation.MULTI_GET;
 import static com.alipay.sofa.jraft.rhea.storage.KVOperation.NODE_EXECUTE;
 import static com.alipay.sofa.jraft.rhea.storage.KVOperation.PUT;
 import static com.alipay.sofa.jraft.rhea.storage.KVOperation.PUT_IF_ABSENT;
+import static com.alipay.sofa.jraft.rhea.storage.KVOperation.PUT_LIST;
 import static com.alipay.sofa.jraft.rhea.storage.KVOperation.RESET_SEQUENCE;
 import static com.alipay.sofa.jraft.rhea.storage.KVOperation.SCAN;
 
@@ -142,6 +144,12 @@ public class MetricsRawKVStore implements RawKVStore {
     }
 
     @Override
+    public void compareAndPut(final byte[] key, final byte[] expect, final byte[] update, final KVStoreClosure closure) {
+        final KVStoreClosure c = metricsAdapter(closure, COMPARE_PUT, 1, update.length);
+        this.rawKVStore.compareAndPut(key, expect, update, c);
+    }
+
+    @Override
     public void merge(final byte[] key, final byte[] value, final KVStoreClosure closure) {
         final KVStoreClosure c = metricsAdapter(closure, MERGE, 1, value.length);
         this.rawKVStore.merge(key, value, c);
@@ -189,6 +197,12 @@ public class MetricsRawKVStore implements RawKVStore {
     public void deleteRange(final byte[] startKey, final byte[] endKey, final KVStoreClosure closure) {
         final KVStoreClosure c = metricsAdapter(closure, DELETE_RANGE, 0, 0);
         this.rawKVStore.deleteRange(startKey, endKey, c);
+    }
+
+    @Override
+    public void delete(final List<byte[]> keys, final KVStoreClosure closure) {
+        final KVStoreClosure c = metricsAdapter(closure, DELETE_LIST, keys.size(), 0);
+        this.rawKVStore.delete(keys, c);
     }
 
     @Override

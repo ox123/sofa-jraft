@@ -139,6 +139,12 @@ public interface RawKVStore {
     void getAndPut(final byte[] key, final byte[] value, final KVStoreClosure closure);
 
     /**
+     * Atomically sets the value to the given updated value
+     * if the current value equal (compare bytes) the expected value.
+     */
+    void compareAndPut(final byte[] key, final byte[] expect, final byte[] update, final KVStoreClosure closure);
+
+    /**
      * Add merge operand for key/value pair.
      *
      *  <pre>
@@ -185,6 +191,11 @@ public interface RawKVStore {
      * Delete all data in the key range of [startKey, endKey).
      */
     void deleteRange(final byte[] startKey, final byte[] endKey, final KVStoreClosure closure);
+
+    /**
+     * Delete data by the {@code keys} in batch.
+     */
+    void delete(final List<byte[]> keys, final KVStoreClosure closure);
 
     /**
      * The {@code nodeExecutor} will be triggered when each node's
