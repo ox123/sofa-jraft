@@ -16,7 +16,6 @@
  */
 package com.alipay.sofa.jraft.rhea;
 
-import com.alipay.sofa.jraft.option.NodeOptions;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.file.Paths;
@@ -35,6 +34,7 @@ import com.alipay.remoting.rpc.RpcServer;
 import com.alipay.sofa.jraft.Lifecycle;
 import com.alipay.sofa.jraft.Status;
 import com.alipay.sofa.jraft.entity.Task;
+import com.alipay.sofa.jraft.option.NodeOptions;
 import com.alipay.sofa.jraft.rhea.client.pd.HeartbeatSender;
 import com.alipay.sofa.jraft.rhea.client.pd.PlacementDriverClient;
 import com.alipay.sofa.jraft.rhea.client.pd.RemotePlacementDriverClient;
@@ -65,10 +65,12 @@ import com.alipay.sofa.jraft.rhea.util.NetUtil;
 import com.alipay.sofa.jraft.rhea.util.Strings;
 import com.alipay.sofa.jraft.rpc.RaftRpcServerFactory;
 import com.alipay.sofa.jraft.util.BytesUtil;
+import com.alipay.sofa.jraft.util.Describer;
 import com.alipay.sofa.jraft.util.Endpoint;
 import com.alipay.sofa.jraft.util.ExecutorServiceHelper;
 import com.alipay.sofa.jraft.util.MetricThreadPoolExecutor;
 import com.alipay.sofa.jraft.util.Requires;
+import com.alipay.sofa.jraft.util.Utils;
 import com.codahale.metrics.ScheduledReporter;
 import com.codahale.metrics.Slf4jReporter;
 
@@ -89,6 +91,7 @@ public class StoreEngine implements Lifecycle<StoreEngineOptions> {
 
     private final ConcurrentMap<Long, RegionKVService> regionKVServiceTable = Maps.newConcurrentMapLong();
     private final ConcurrentMap<Long, RegionEngine>    regionEngineTable    = Maps.newConcurrentMapLong();
+    private final StateListenerContainer<Long>         stateListenerContainer;
     private final PlacementDriverClient                pdClient;
     private final long                                 clusterId;
 
@@ -116,9 +119,10 @@ public class StoreEngine implements Lifecycle<StoreEngineOptions> {
 
     private boolean                                    started;
 
-    public StoreEngine(PlacementDriverClient pdClient) {
-        this.pdClient = pdClient;
+    public StoreEngine(PlacementDriverClient pdClient, StateListenerContainer<Long> stateListenerContainer) {
+        this.pdClient = Requires.requireNonNull(pdClient, "pdClient");
         this.clusterId = pdClient.getClusterId();
+        this.stateListenerContainer = Requires.requireNonNull(stateListenerContainer, "stateListenerContainer");
     }
 
     @Override
@@ -131,7 +135,7 @@ public class StoreEngine implements Lifecycle<StoreEngineOptions> {
         Endpoint serverAddress = Requires.requireNonNull(opts.getServerAddress(), "opts.serverAddress");
         final int port = serverAddress.getPort();
         final String ip = serverAddress.getIp();
-        if (ip == null || Constants.IP_ANY.equals(ip)) {
+        if (ip == null || Utils.IP_ANY.equals(ip)) {
             serverAddress = new Endpoint(NetUtil.getLocalCanonicalHostName(), port);
             opts.setServerAddress(serverAddress);
         }
@@ -176,7 +180,8 @@ public class StoreEngine implements Lifecycle<StoreEngineOptions> {
             this.raftStateTrigger = StoreEngineHelper.createRaftStateTrigger(opts.getLeaderStateTriggerCoreThreads());
         }
         if (this.snapshotExecutor == null) {
-            this.snapshotExecutor = StoreEngineHelper.createSnapshotExecutor(opts.getSnapshotCoreThreads());
+            this.snapshotExecutor = StoreEngineHelper.createSnapshotExecutor(opts.getSnapshotCoreThreads(),
+                opts.getSnapshotMaxThreads());
         }
         // init rpc executors
         final boolean useSharedRpcExecutor = opts.isUseSharedRpcExecutor();
@@ -204,6 +209,9 @@ public class StoreEngine implements Lifecycle<StoreEngineOptions> {
         // init db store
         if (!initRawKVStore(opts)) {
             return false;
+        }
+        if (this.rawKVStore instanceof Describer) {
+            DescriberManager.getInstance().addDescriber((Describer) this.rawKVStore);
         }
         // init all region engine
         if (!initAllRegionEngine(opts, store)) {
@@ -411,6 +419,10 @@ public class StoreEngine implements Lifecycle<StoreEngineOptions> {
         return false;
     }
 
+    public StateListenerContainer<Long> getStateListenerContainer() {
+        return stateListenerContainer;
+    }
+
     public List<Long> getLeaderRegionIds() {
         final List<Long> regionIds = Lists.newArrayListWithCapacity(this.regionEngineTable.size());
         for (final RegionEngine regionEngine : this.regionEngineTable.values()) {
@@ -491,7 +503,7 @@ public class StoreEngine implements Lifecycle<StoreEngineOptions> {
         parentEngine.getNode().apply(task);
     }
 
-    public void doSplit(final Long regionId, final Long newRegionId, final byte[] splitKey, final KVStoreClosure closure) {
+    public void doSplit(final Long regionId, final Long newRegionId, final byte[] splitKey) {
         try {
             Requires.requireNonNull(regionId, "regionId");
             Requires.requireNonNull(newRegionId, "newRegionId");
@@ -517,12 +529,7 @@ public class StoreEngine implements Lifecycle<StoreEngineOptions> {
             final RegionEngine engine = new RegionEngine(region, this);
             if (!engine.init(rOpts)) {
                 LOG.error("Fail to init [RegionEngine: {}].", region);
-                if (closure != null) {
-                    // null on follower
-                    closure.setError(Errors.REGION_ENGINE_FAIL);
-                    closure.run(new Status(-1, "Fail to init [RegionEngine: %s].", region));
-                }
-                return;
+                throw Errors.REGION_ENGINE_FAIL.exception();
             }
 
             // update parent conf
@@ -540,11 +547,6 @@ public class StoreEngine implements Lifecycle<StoreEngineOptions> {
 
             // update local regionRouteTable
             this.pdClient.getRegionRouteTable().splitRegion(pRegion.getId(), region);
-            if (closure != null) {
-                // null on follower
-                closure.setData(Boolean.TRUE);
-                closure.run(Status.OK());
-            }
         } finally {
             this.splitting.set(false);
         }
@@ -601,7 +603,6 @@ public class StoreEngine implements Lifecycle<StoreEngineOptions> {
         RocksDBOptions rocksOpts = opts.getRocksDBOptions();
         if (rocksOpts == null) {
             rocksOpts = new RocksDBOptions();
-            rocksOpts.setSync(true);
             opts.setRocksDBOptions(rocksOpts);
         }
         String dbPath = rocksOpts.getDbPath();

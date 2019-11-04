@@ -38,7 +38,6 @@ import com.alipay.sofa.jraft.rpc.ProtobufMsgFactory;
 import com.alipay.sofa.jraft.rpc.RpcRequests.ErrorResponse;
 import com.alipay.sofa.jraft.rpc.RpcRequests.PingRequest;
 import com.alipay.sofa.jraft.rpc.RpcResponseClosure;
-import com.alipay.sofa.jraft.rpc.impl.core.BoltRaftClientService;
 import com.alipay.sofa.jraft.rpc.impl.core.JRaftRpcAddressParser;
 import com.alipay.sofa.jraft.util.Endpoint;
 import com.alipay.sofa.jraft.util.NamedThreadFactory;
@@ -56,13 +55,13 @@ import com.google.protobuf.Message;
  */
 public abstract class AbstractBoltClientService implements ClientService {
 
-    protected static final Logger   LOG = LoggerFactory.getLogger(BoltRaftClientService.class);
+    protected static final Logger   LOG = LoggerFactory.getLogger(AbstractBoltClientService.class);
 
     static {
         ProtobufMsgFactory.load();
     }
 
-    protected RpcClient             rpcClient;
+    protected volatile RpcClient    rpcClient;
     protected ThreadPoolExecutor    rpcExecutor;
     protected RpcOptions            rpcOptions;
     protected JRaftRpcAddressParser rpcAddressParser;
@@ -74,7 +73,12 @@ public abstract class AbstractBoltClientService implements ClientService {
 
     @Override
     public boolean isConnected(final Endpoint endpoint) {
-        return this.rpcClient.checkConnection(endpoint.toString());
+        final RpcClient rc = this.rpcClient;
+        return rc != null && isConnected(rc, endpoint);
+    }
+
+    private static boolean isConnected(final RpcClient rpcClient, final Endpoint endpoint) {
+        return rpcClient.checkConnection(endpoint.toString());
     }
 
     @Override
@@ -125,18 +129,19 @@ public abstract class AbstractBoltClientService implements ClientService {
 
     @Override
     public boolean connect(final Endpoint endpoint) {
-        if (this.rpcClient == null) {
-            throw new IllegalStateException("Client service is not inited.");
+        final RpcClient rc = this.rpcClient;
+        if (rc == null) {
+            throw new IllegalStateException("Client service is uninitialized.");
         }
-        if (isConnected(endpoint)) {
+        if (isConnected(rc, endpoint)) {
             return true;
         }
         try {
             final PingRequest req = PingRequest.newBuilder() //
                 .setSendTimestamp(System.currentTimeMillis()) //
                 .build();
-            final ErrorResponse resp = (ErrorResponse) this.rpcClient.invokeSync(endpoint.toString(), req,
-                this.defaultInvokeCtx, this.rpcOptions.getRpcConnectTimeoutMs());
+            final ErrorResponse resp = (ErrorResponse) rc.invokeSync(endpoint.toString(), req, this.defaultInvokeCtx,
+                this.rpcOptions.getRpcConnectTimeoutMs());
             return resp.getErrorCode() == 0;
         } catch (final InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -149,8 +154,12 @@ public abstract class AbstractBoltClientService implements ClientService {
 
     @Override
     public boolean disconnect(final Endpoint endpoint) {
-        LOG.info("Disconnect from {}", endpoint);
-        this.rpcClient.closeConnection(endpoint.toString());
+        final RpcClient rc = this.rpcClient;
+        if (rc == null) {
+            return true;
+        }
+        LOG.info("Disconnect from {}.", endpoint);
+        rc.closeConnection(endpoint.toString());
         return true;
     }
 
@@ -176,10 +185,18 @@ public abstract class AbstractBoltClientService implements ClientService {
                                                               final InvokeContext ctx,
                                                               final RpcResponseClosure<T> done, final int timeoutMs,
                                                               final Executor rpcExecutor) {
+        final RpcClient rc = this.rpcClient;
+
         final FutureImpl<Message> future = new FutureImpl<>();
         try {
+            if (rc == null) {
+                future.failure(new IllegalStateException("Client service is uninitialized."));
+                // should be in another thread to avoid dead locking.
+                Utils.runClosureInThread(done, new Status(RaftError.EINTERNAL, "Client service is uninitialized."));
+                return future;
+            }
             final Url rpcUrl = this.rpcAddressParser.parse(endpoint.toString());
-            this.rpcClient.invokeWithCallback(rpcUrl, request, ctx, new InvokeCallback() {
+            rc.invokeWithCallback(rpcUrl, request, ctx, new InvokeCallback() {
 
                 @SuppressWarnings("unchecked")
                 @Override

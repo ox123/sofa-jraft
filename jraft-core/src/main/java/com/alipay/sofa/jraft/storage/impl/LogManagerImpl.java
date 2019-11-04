@@ -52,6 +52,7 @@ import com.alipay.sofa.jraft.storage.LogManager;
 import com.alipay.sofa.jraft.storage.LogStorage;
 import com.alipay.sofa.jraft.util.ArrayDeque;
 import com.alipay.sofa.jraft.util.DisruptorBuilder;
+import com.alipay.sofa.jraft.util.DisruptorMetricSet;
 import com.alipay.sofa.jraft.util.LogExceptionHandler;
 import com.alipay.sofa.jraft.util.NamedThreadFactory;
 import com.alipay.sofa.jraft.util.Requires;
@@ -137,13 +138,13 @@ public class LogManagerImpl implements LogManager {
      */
     private static class WaitMeta {
         /** callback when new log come in*/
-        onNewLogCallback onNewLog;
+        NewLogCallback onNewLog;
         /** callback error code*/
-        int              errorCode;
+        int            errorCode;
         /** the waiter pass-in argument */
-        Object           arg;
+        Object         arg;
 
-        public WaitMeta(final onNewLogCallback onNewLog, final Object arg, final int errorCode) {
+        public WaitMeta(final NewLogCallback onNewLog, final Object arg, final int errorCode) {
             super();
             this.onNewLog = onNewLog;
             this.arg = arg;
@@ -202,8 +203,10 @@ public class LogManagerImpl implements LogManager {
             this.disruptor.handleEventsWith(new StableClosureEventHandler());
             this.disruptor.setDefaultExceptionHandler(new LogExceptionHandler<Object>(this.getClass().getSimpleName(),
                     (event, ex) -> reportError(-1, "LogManager handle event error")));
-            this.diskQueue = this.disruptor.getRingBuffer();
-            this.disruptor.start();
+            this.diskQueue = this.disruptor.start();
+            if(this.nodeMetrics.getMetricRegistry() != null) {
+                this.nodeMetrics.getMetricRegistry().register("jraft-log-manager-disruptor", new DisruptorMetricSet(this.diskQueue));
+            }
         } finally {
             this.writeLock.unlock();
         }
@@ -775,7 +778,7 @@ public class LogManagerImpl implements LogManager {
 
     @Override
     public long getLastLogIndex() {
-        return this.getLastLogIndex(false);
+        return getLastLogIndex(false);
     }
 
     @Override
@@ -1053,7 +1056,7 @@ public class LogManagerImpl implements LogManager {
     }
 
     @Override
-    public long wait(final long expectedLastLogIndex, final onNewLogCallback cb, final Object arg) {
+    public long wait(final long expectedLastLogIndex, final NewLogCallback cb, final Object arg) {
         final WaitMeta wm = new WaitMeta(cb, arg, 0);
         return notifyOnNewLog(expectedLastLogIndex, wm);
     }
@@ -1132,5 +1135,35 @@ public class LogManagerImpl implements LogManager {
         } finally {
             this.readLock.unlock();
         }
+    }
+
+    @Override
+    public void describe(final Printer out) {
+        final long _firstLogIndex;
+        final long _lastLogIndex;
+        final String _diskId;
+        final String _appliedId;
+        final String _lastSnapshotId;
+        this.readLock.lock();
+        try {
+            _firstLogIndex = this.firstLogIndex;
+            _lastLogIndex = this.lastLogIndex;
+            _diskId = String.valueOf(this.diskId);
+            _appliedId = String.valueOf(this.appliedId);
+            _lastSnapshotId = String.valueOf(this.lastSnapshotId);
+        } finally {
+            this.readLock.unlock();
+        }
+        out.print("  storage: [") //
+            .print(_firstLogIndex) //
+            .print(", ") //
+            .print(_lastLogIndex) //
+            .println(']');
+        out.print("  diskId: ") //
+            .println(_diskId);
+        out.print("  appliedId: ") //
+            .println(_appliedId);
+        out.print("  lastSnapshotId: ") //
+            .println(_lastSnapshotId);
     }
 }

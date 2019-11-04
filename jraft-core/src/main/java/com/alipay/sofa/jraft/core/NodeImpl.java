@@ -19,6 +19,7 @@ package com.alipay.sofa.jraft.core;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
@@ -96,12 +97,18 @@ import com.alipay.sofa.jraft.storage.RaftMetaStorage;
 import com.alipay.sofa.jraft.storage.SnapshotExecutor;
 import com.alipay.sofa.jraft.storage.impl.LogManagerImpl;
 import com.alipay.sofa.jraft.storage.snapshot.SnapshotExecutorImpl;
+import com.alipay.sofa.jraft.util.Describer;
 import com.alipay.sofa.jraft.util.DisruptorBuilder;
+import com.alipay.sofa.jraft.util.DisruptorMetricSet;
+import com.alipay.sofa.jraft.util.JRaftServiceLoader;
+import com.alipay.sofa.jraft.util.JRaftSignalHandler;
 import com.alipay.sofa.jraft.util.LogExceptionHandler;
 import com.alipay.sofa.jraft.util.NamedThreadFactory;
 import com.alipay.sofa.jraft.util.OnlyForTest;
+import com.alipay.sofa.jraft.util.Platform;
 import com.alipay.sofa.jraft.util.RepeatedTimer;
 import com.alipay.sofa.jraft.util.Requires;
+import com.alipay.sofa.jraft.util.SignalHelper;
 import com.alipay.sofa.jraft.util.ThreadHelper;
 import com.alipay.sofa.jraft.util.ThreadId;
 import com.alipay.sofa.jraft.util.Utils;
@@ -123,63 +130,85 @@ import com.lmax.disruptor.dsl.ProducerType;
  */
 public class NodeImpl implements Node, RaftServerService {
 
+    private static final Logger                                            LOG                      = LoggerFactory
+                                                                                                        .getLogger(NodeImpl.class);
+
+    static {
+        try {
+            if (SignalHelper.supportSignal()) {
+                // TODO support windows signal
+                if (!Platform.isWindows()) {
+                    final List<JRaftSignalHandler> handlers = JRaftServiceLoader.load(JRaftSignalHandler.class) //
+                        .sort();
+                    SignalHelper.addSignal(SignalHelper.SIG_USR2, handlers);
+                }
+            }
+        } catch (final Throwable t) {
+            LOG.error("Fail to add signal.", t);
+        }
+    }
+
     // Max retry times when applying tasks.
-    private static final int               MAX_APPLY_RETRY_TIMES = 3;
+    private static final int                                               MAX_APPLY_RETRY_TIMES    = 3;
 
-    private static final Logger            LOG                   = LoggerFactory.getLogger(NodeImpl.class);
-
-    public static final AtomicInteger      GLOBAL_NUM_NODES      = new AtomicInteger(0);
+    public static final AtomicInteger                                      GLOBAL_NUM_NODES         = new AtomicInteger(
+                                                                                                        0);
 
     /** Internal states */
-    private final ReadWriteLock            readWriteLock         = new ReentrantReadWriteLock();
-    protected final Lock                   writeLock             = this.readWriteLock.writeLock();
-    protected final Lock                   readLock              = this.readWriteLock.readLock();
-    private volatile State                 state;
-    private volatile CountDownLatch        shutdownLatch;
-    private long                           currTerm;
-    private volatile long                  lastLeaderTimestamp;
-    private PeerId                         leaderId              = new PeerId();
-    private PeerId                         votedId;
-    private final Ballot                   voteCtx               = new Ballot();
-    private final Ballot                   prevVoteCtx           = new Ballot();
-    private ConfigurationEntry             conf;
-    private StopTransferArg                stopTransferArg;
+    private final ReadWriteLock                                            readWriteLock            = new ReentrantReadWriteLock();
+    protected final Lock                                                   writeLock                = this.readWriteLock
+                                                                                                        .writeLock();
+    protected final Lock                                                   readLock                 = this.readWriteLock
+                                                                                                        .readLock();
+    private volatile State                                                 state;
+    private volatile CountDownLatch                                        shutdownLatch;
+    private long                                                           currTerm;
+    private volatile long                                                  lastLeaderTimestamp;
+    private PeerId                                                         leaderId                 = new PeerId();
+    private PeerId                                                         votedId;
+    private final Ballot                                                   voteCtx                  = new Ballot();
+    private final Ballot                                                   prevVoteCtx              = new Ballot();
+    private ConfigurationEntry                                             conf;
+    private StopTransferArg                                                stopTransferArg;
     /** Raft group and node options and identifier */
-    private final String                   groupId;
-    private NodeOptions                    options;
-    private RaftOptions                    raftOptions;
-    private final PeerId                   serverId;
+    private final String                                                   groupId;
+    private NodeOptions                                                    options;
+    private RaftOptions                                                    raftOptions;
+    private final PeerId                                                   serverId;
     /** Other services */
-    private final ConfigurationCtx         confCtx;
-    private LogStorage                     logStorage;
-    private RaftMetaStorage                metaStorage;
-    private ClosureQueue                   closureQueue;
-    private ConfigurationManager           configManager;
-    private LogManager                     logManager;
-    private FSMCaller                      fsmCaller;
-    private BallotBox                      ballotBox;
-    private SnapshotExecutor               snapshotExecutor;
-    private ReplicatorGroup                replicatorGroup;
-    private final List<Closure>            shutdownContinuations = new ArrayList<>();
-    private RaftClientService              rpcService;
-    private ReadOnlyService                readOnlyService;
+    private final ConfigurationCtx                                         confCtx;
+    private LogStorage                                                     logStorage;
+    private RaftMetaStorage                                                metaStorage;
+    private ClosureQueue                                                   closureQueue;
+    private ConfigurationManager                                           configManager;
+    private LogManager                                                     logManager;
+    private FSMCaller                                                      fsmCaller;
+    private BallotBox                                                      ballotBox;
+    private SnapshotExecutor                                               snapshotExecutor;
+    private ReplicatorGroup                                                replicatorGroup;
+    private final List<Closure>                                            shutdownContinuations    = new ArrayList<>();
+    private RaftClientService                                              rpcService;
+    private ReadOnlyService                                                readOnlyService;
     /** Timers */
-    private TimerManager                   timerManager;
-    private RepeatedTimer                  electionTimer;
-    private RepeatedTimer                  voteTimer;
-    private RepeatedTimer                  stepDownTimer;
-    private RepeatedTimer                  snapshotTimer;
-    private ScheduledFuture<?>             transferTimer;
-    private ThreadId                       wakingCandidate;
+    private TimerManager                                                   timerManager;
+    private RepeatedTimer                                                  electionTimer;
+    private RepeatedTimer                                                  voteTimer;
+    private RepeatedTimer                                                  stepDownTimer;
+    private RepeatedTimer                                                  snapshotTimer;
+    private ScheduledFuture<?>                                             transferTimer;
+    private ThreadId                                                       wakingCandidate;
     /** Disruptor to run node service */
-    private Disruptor<LogEntryAndClosure>  applyDisruptor;
-    private RingBuffer<LogEntryAndClosure> applyQueue;
+    private Disruptor<LogEntryAndClosure>                                  applyDisruptor;
+    private RingBuffer<LogEntryAndClosure>                                 applyQueue;
 
     /** Metrics*/
-    private NodeMetrics                    metrics;
+    private NodeMetrics                                                    metrics;
 
-    private NodeId                         nodeId;
-    private JRaftServiceFactory            serviceFactory;
+    private NodeId                                                         nodeId;
+    private JRaftServiceFactory                                            serviceFactory;
+
+    /** ReplicatorStateListeners */
+    private final CopyOnWriteArrayList<Replicator.ReplicatorStateListener> replicatorStateListeners = new CopyOnWriteArrayList<>();
 
     /**
      * Node service event.
@@ -727,8 +756,11 @@ public class NodeImpl implements Node, RaftServerService {
             .build();
         this.applyDisruptor.handleEventsWith(new LogEntryAndClosureHandler());
         this.applyDisruptor.setDefaultExceptionHandler(new LogExceptionHandler<Object>(getClass().getSimpleName()));
-        this.applyDisruptor.start();
-        this.applyQueue = this.applyDisruptor.getRingBuffer();
+        this.applyQueue = this.applyDisruptor.start();
+        if (this.metrics.getMetricRegistry() != null) {
+            this.metrics.getMetricRegistry().register("jraft-node-impl-disruptor",
+                new DisruptorMetricSet(this.applyQueue));
+        }
 
         this.fsmCaller = new FSMCallerImpl();
         if (!initLogStorage()) {
@@ -1330,6 +1362,7 @@ public class NodeImpl implements Node, RaftServerService {
             }
 
         } catch (final Exception e) {
+            LOG.error("Fail to apply task.", e);
             Utils.runClosureInThread(task.getDone(), new Status(RaftError.EPERM, "Node is down."));
         }
     }
@@ -2304,6 +2337,7 @@ public class NodeImpl implements Node, RaftServerService {
 
     @Override
     public void shutdown(final Closure done) {
+        List<RepeatedTimer> timers = null;
         this.writeLock.lock();
         try {
             LOG.info("Node {} shutdown, currTerm={} state={}.", getNodeId(), this.currTerm, this.state);
@@ -2316,19 +2350,8 @@ public class NodeImpl implements Node, RaftServerService {
                             new Status(RaftError.ESHUTDOWN, "Raft node is going to quit."));
                 }
                 this.state = State.STATE_SHUTTING;
-                // Destroy all timers
-                if (this.electionTimer != null) {
-                    this.electionTimer.destroy();
-                }
-                if (this.voteTimer != null) {
-                    this.voteTimer.destroy();
-                }
-                if (this.stepDownTimer != null) {
-                    this.stepDownTimer.destroy();
-                }
-                if (this.snapshotTimer != null) {
-                    this.snapshotTimer.destroy();
-                }
+                // Stop all timers
+                timers = stopAllTimers();
                 if (this.readOnlyService != null) {
                     this.readOnlyService.shutdown();
                 }
@@ -2379,6 +2402,39 @@ public class NodeImpl implements Node, RaftServerService {
             }
         } finally {
             this.writeLock.unlock();
+
+            // Destroy all timers out of lock
+            if (timers != null) {
+                destroyAllTimers(timers);
+            }
+        }
+    }
+
+    // Should in lock
+    private List<RepeatedTimer> stopAllTimers() {
+        final List<RepeatedTimer> timers = new ArrayList<>();
+        if (this.electionTimer != null) {
+            this.electionTimer.stop();
+            timers.add(this.electionTimer);
+        }
+        if (this.voteTimer != null) {
+            this.voteTimer.stop();
+            timers.add(this.voteTimer);
+        }
+        if (this.stepDownTimer != null) {
+            this.stepDownTimer.stop();
+            timers.add(this.stepDownTimer);
+        }
+        if (this.snapshotTimer != null) {
+            this.snapshotTimer.stop();
+            timers.add(this.snapshotTimer);
+        }
+        return timers;
+    }
+
+    private void destroyAllTimers(final List<RepeatedTimer> timers) {
+        for (final RepeatedTimer timer : timers) {
+            timer.destroy();
         }
     }
 
@@ -2836,6 +2892,97 @@ public class NodeImpl implements Node, RaftServerService {
         } while (entry != null);
 
         throw new LogNotFoundException("User log is deleted at index: " + curIndex);
+    }
+
+    @Override
+    public void addReplicatorStateListener(final Replicator.ReplicatorStateListener replicatorStateListener) {
+        Requires.requireNonNull(replicatorStateListener, "replicatorStateListener");
+        this.replicatorStateListeners.add(replicatorStateListener);
+    }
+
+    @Override
+    public void removeReplicatorStateListener(final Replicator.ReplicatorStateListener replicatorStateListener) {
+        Requires.requireNonNull(replicatorStateListener, "replicatorStateListener");
+        this.replicatorStateListeners.remove(replicatorStateListener);
+    }
+
+    @Override
+    public void clearReplicatorStateListeners() {
+        this.replicatorStateListeners.clear();
+    }
+
+    @Override
+    public List<Replicator.ReplicatorStateListener> getReplicatorStatueListeners() {
+        return this.replicatorStateListeners;
+    }
+
+    @Override
+    public void describe(final Printer out) {
+        // node
+        final String _nodeId;
+        final String _state;
+        final String _leaderId;
+        final long _currTerm;
+        final String _conf;
+        this.readLock.lock();
+        try {
+            _nodeId = String.valueOf(getNodeId());
+            _state = String.valueOf(this.state);
+            _leaderId = String.valueOf(this.leaderId);
+            _currTerm = this.currTerm;
+            _conf = String.valueOf(this.conf);
+        } finally {
+            this.readLock.unlock();
+        }
+        out.print("nodeId: ") //
+            .println(_nodeId);
+        out.print("state: ") //
+            .println(_state);
+        out.print("leaderId: ") //
+            .println(_leaderId);
+        out.print("term: ") //
+            .println(_currTerm);
+        out.print("conf: ") //
+            .println(_conf);
+
+        // timers
+        out.println("electionTimer: ");
+        this.electionTimer.describe(out);
+
+        out.println("voteTimer: ");
+        this.voteTimer.describe(out);
+
+        out.println("stepDownTimer: ");
+        this.stepDownTimer.describe(out);
+
+        out.println("snapshotTimer: ");
+        this.snapshotTimer.describe(out);
+
+        // logManager
+        out.println("logManager: ");
+        this.logManager.describe(out);
+
+        // fsmCaller
+        out.println("fsmCaller: ");
+        this.fsmCaller.describe(out);
+
+        // ballotBox
+        out.println("ballotBox: ");
+        this.ballotBox.describe(out);
+
+        // snapshotExecutor
+        out.println("snapshotExecutor: ");
+        this.snapshotExecutor.describe(out);
+
+        // replicators
+        out.println("replicatorGroup: ");
+        this.replicatorGroup.describe(out);
+
+        // log storage
+        if (this.logStorage instanceof Describer) {
+            out.println("logStorage: ");
+            ((Describer) this.logStorage).describe(out);
+        }
     }
 
     @Override

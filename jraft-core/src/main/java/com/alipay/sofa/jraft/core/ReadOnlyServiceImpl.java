@@ -46,6 +46,7 @@ import com.alipay.sofa.jraft.rpc.RpcRequests.ReadIndexResponse;
 import com.alipay.sofa.jraft.rpc.RpcResponseClosureAdapter;
 import com.alipay.sofa.jraft.util.Bytes;
 import com.alipay.sofa.jraft.util.DisruptorBuilder;
+import com.alipay.sofa.jraft.util.DisruptorMetricSet;
 import com.alipay.sofa.jraft.util.LogExceptionHandler;
 import com.alipay.sofa.jraft.util.NamedThreadFactory;
 import com.alipay.sofa.jraft.util.OnlyForTest;
@@ -167,14 +168,15 @@ public class ReadOnlyServiceImpl implements ReadOnlyService, LastAppliedLogIndex
             ReadOnlyServiceImpl.this.lock.lock();
             try {
                 if (readIndexStatus.isApplied(ReadOnlyServiceImpl.this.fsmCaller.getLastAppliedIndex())) {
-                    // Already applied,notify readIndex request.
+                    // Already applied, notify readIndex request.
                     ReadOnlyServiceImpl.this.lock.unlock();
                     doUnlock = false;
                     notifySuccess(readIndexStatus);
                 } else {
                     // Not applied, add it to pending-notify cache.
                     ReadOnlyServiceImpl.this.pendingNotifyStatus
-                    .computeIfAbsent(readIndexStatus.getIndex(), k -> new ArrayList<>(10)).add(readIndexStatus);
+                        .computeIfAbsent(readIndexStatus.getIndex(), k -> new ArrayList<>(10)) //
+                        .add(readIndexStatus);
                 }
             } finally {
                 if (doUnlock) {
@@ -223,26 +225,32 @@ public class ReadOnlyServiceImpl implements ReadOnlyService, LastAppliedLogIndex
         this.raftOptions = opts.getRaftOptions();
 
         this.scheduledExecutorService = Executors
-                .newSingleThreadScheduledExecutor(new NamedThreadFactory("ReadOnlyService-PendingNotify-Scanner", true));
+            .newSingleThreadScheduledExecutor(new NamedThreadFactory("ReadOnlyService-PendingNotify-Scanner", true));
         this.readIndexDisruptor = DisruptorBuilder.<ReadIndexEvent> newInstance() //
-                .setEventFactory(new ReadIndexEventFactory()) //
-                .setRingBufferSize(this.raftOptions.getDisruptorBufferSize()) //
-                .setThreadFactory(new NamedThreadFactory("JRaft-ReadOnlyService-Disruptor-", true)) //
-                .setWaitStrategy(new BlockingWaitStrategy()) //
-                .setProducerType(ProducerType.MULTI) //
-                .build();
+            .setEventFactory(new ReadIndexEventFactory()) //
+            .setRingBufferSize(this.raftOptions.getDisruptorBufferSize()) //
+            .setThreadFactory(new NamedThreadFactory("JRaft-ReadOnlyService-Disruptor-", true)) //
+            .setWaitStrategy(new BlockingWaitStrategy()) //
+            .setProducerType(ProducerType.MULTI) //
+            .build();
         this.readIndexDisruptor.handleEventsWith(new ReadIndexEventHandler());
         this.readIndexDisruptor
-        .setDefaultExceptionHandler(new LogExceptionHandler<Object>(this.getClass().getSimpleName()));
-        this.readIndexDisruptor.start();
-        this.readIndexQueue = this.readIndexDisruptor.getRingBuffer();
-
+            .setDefaultExceptionHandler(new LogExceptionHandler<Object>(this.getClass().getSimpleName()));
+        this.readIndexQueue = this.readIndexDisruptor.start();
+        if(this.nodeMetrics.getMetricRegistry() != null) {
+            this.nodeMetrics.getMetricRegistry() //
+                .register("jraft-read-only-service-disruptor", new DisruptorMetricSet(this.readIndexQueue));
+        }
         // listen on lastAppliedLogIndex change events.
         this.fsmCaller.addLastAppliedLogIndexListener(this);
 
         // start scanner
-        this.scheduledExecutorService.scheduleAtFixedRate(() -> onApplied(this.fsmCaller.getLastAppliedIndex()),
-            this.raftOptions.getMaxElectionDelayMs(), this.raftOptions.getMaxElectionDelayMs(), TimeUnit.MILLISECONDS);
+        this.scheduledExecutorService.scheduleAtFixedRate(
+            () -> onApplied(this.fsmCaller.getLastAppliedIndex()),
+            this.raftOptions.getMaxElectionDelayMs(),
+            this.raftOptions.getMaxElectionDelayMs(),
+            TimeUnit.MILLISECONDS
+        );
         return true;
     }
 
