@@ -204,8 +204,9 @@ public class LogManagerImpl implements LogManager {
             this.disruptor.setDefaultExceptionHandler(new LogExceptionHandler<Object>(this.getClass().getSimpleName(),
                     (event, ex) -> reportError(-1, "LogManager handle event error")));
             this.diskQueue = this.disruptor.start();
-            if(this.nodeMetrics.getMetricRegistry() != null) {
-                this.nodeMetrics.getMetricRegistry().register("jraft-log-manager-disruptor", new DisruptorMetricSet(this.diskQueue));
+            if (this.nodeMetrics.getMetricRegistry() != null) {
+                this.nodeMetrics.getMetricRegistry().register("jraft-log-manager-disruptor",
+                    new DisruptorMetricSet(this.diskQueue));
             }
         } finally {
             this.writeLock.unlock();
@@ -215,10 +216,10 @@ public class LogManagerImpl implements LogManager {
 
     private void stopDiskThread() {
         this.shutDownLatch = new CountDownLatch(1);
-        this.diskQueue.publishEvent((event, sequence) -> {
+        Utils.runInThread(() -> this.diskQueue.publishEvent((event, sequence) -> {
             event.reset();
             event.type = EventType.SHUTDOWN;
-        });
+        }));
     }
 
     @Override
@@ -318,10 +319,10 @@ public class LogManagerImpl implements LogManager {
                 if (entry.getType() == EntryType.ENTRY_TYPE_CONFIGURATION) {
                     Configuration oldConf = new Configuration();
                     if (entry.getOldPeers() != null) {
-                        oldConf = new Configuration(entry.getOldPeers());
+                        oldConf = new Configuration(entry.getOldPeers(), entry.getOldLearners());
                     }
                     final ConfigurationEntry conf = new ConfigurationEntry(entry.getId(),
-                        new Configuration(entry.getPeers()), oldConf);
+                        new Configuration(entry.getPeers(), entry.getLearners()), oldConf);
                     this.configManager.add(conf);
                 }
             }
@@ -365,11 +366,14 @@ public class LogManagerImpl implements LogManager {
             Utils.runClosureInThread(done, new Status(RaftError.ESTOP, "Log manager is stopped."));
             return;
         }
-        this.diskQueue.publishEvent((event, sequence) -> {
+        if (!this.diskQueue.tryPublishEvent((event, sequence) -> {
             event.reset();
             event.type = type;
             event.done = done;
-        });
+        })) {
+            reportError(RaftError.EBUSY.getNumber(), "Log manager is overload.");
+            Utils.runClosureInThread(done, new Status(RaftError.EBUSY, "Log manager is overload."));
+        }
     }
 
     private boolean tryOfferEvent(final StableClosure done, final EventTranslator<StableClosureEvent> translator) {
@@ -464,14 +468,21 @@ public class LogManagerImpl implements LogManager {
                 this.lastId = appendToStorage(this.toAppend);
                 for (int i = 0; i < this.size; i++) {
                     this.storage.get(i).getEntries().clear();
-                    if (LogManagerImpl.this.hasError) {
-                        this.storage.get(i).run(new Status(RaftError.EIO, "Corrupted LogStorage"));
-                    } else {
-                        this.storage.get(i).run(Status.OK());
+                    Status st = null;
+                    try {
+                        if (LogManagerImpl.this.hasError) {
+                            st = new Status(RaftError.EIO, "Corrupted LogStorage");
+                        } else {
+                            st = Status.OK();
+                        }
+                        this.storage.get(i).run(st);
+                    } catch (Throwable t) {
+                        LOG.error("Fail to run closure with status: {}.", st, t);
                     }
                 }
                 this.toAppend.clear();
                 this.storage.clear();
+
             }
             this.size = 0;
             this.bufferSize = 0;
@@ -596,24 +607,14 @@ public class LogManagerImpl implements LogManager {
 
     @Override
     public void setSnapshot(final SnapshotMeta meta) {
-        LOG.debug("set snapshot: {}", meta);
+        LOG.debug("set snapshot: {}.", meta);
         this.writeLock.lock();
         try {
             if (meta.getLastIncludedIndex() <= this.lastSnapshotId.getIndex()) {
                 return;
             }
-            final Configuration conf = new Configuration();
-            for (int i = 0; i < meta.getPeersCount(); i++) {
-                final PeerId peer = new PeerId();
-                peer.parse(meta.getPeers(i));
-                conf.addPeer(peer);
-            }
-            final Configuration oldConf = new Configuration();
-            for (int i = 0; i < meta.getOldPeersCount(); i++) {
-                final PeerId peer = new PeerId();
-                peer.parse(meta.getOldPeers(i));
-                oldConf.addPeer(peer);
-            }
+            final Configuration conf = confFromMeta(meta);
+            final Configuration oldConf = oldConfFromMeta(meta);
 
             final ConfigurationEntry entry = new ConfigurationEntry(new LogId(meta.getLastIncludedIndex(),
                 meta.getLastIncludedTerm()), conf, oldConf);
@@ -643,13 +644,43 @@ public class LogManagerImpl implements LogManager {
                 }
             } else {
                 if (!reset(meta.getLastIncludedIndex() + 1)) {
-                    LOG.warn("Reset log manager failed, nextLogIndex={}", meta.getLastIncludedIndex() + 1);
+                    LOG.warn("Reset log manager failed, nextLogIndex={}.", meta.getLastIncludedIndex() + 1);
                 }
             }
         } finally {
             this.writeLock.unlock();
         }
 
+    }
+
+    private Configuration oldConfFromMeta(final SnapshotMeta meta) {
+        final Configuration oldConf = new Configuration();
+        for (int i = 0; i < meta.getOldPeersCount(); i++) {
+            final PeerId peer = new PeerId();
+            peer.parse(meta.getOldPeers(i));
+            oldConf.addPeer(peer);
+        }
+        for (int i = 0; i < meta.getOldLearnersCount(); i++) {
+            final PeerId peer = new PeerId();
+            peer.parse(meta.getOldLearners(i));
+            oldConf.addLearner(peer);
+        }
+        return oldConf;
+    }
+
+    private Configuration confFromMeta(final SnapshotMeta meta) {
+        final Configuration conf = new Configuration();
+        for (int i = 0; i < meta.getPeersCount(); i++) {
+            final PeerId peer = new PeerId();
+            peer.parse(meta.getPeers(i));
+            conf.addPeer(peer);
+        }
+        for (int i = 0; i < meta.getLearnersCount(); i++) {
+            final PeerId peer = new PeerId();
+            peer.parse(meta.getLearners(i));
+            conf.addLearner(peer);
+        }
+        return conf;
     }
 
     @Override
@@ -731,13 +762,13 @@ public class LogManagerImpl implements LogManager {
         }
         this.readLock.lock();
         try {
-            // out of range, direct return NULL
-            if (index > this.lastLogIndex) {
-                return 0;
-            }
             // check index equal snapshot_index, return snapshot_term
             if (index == this.lastSnapshotId.getIndex()) {
                 return this.lastSnapshotId.getTerm();
+            }
+            // out of range, direct return 0
+            if (index > this.lastLogIndex || index < this.firstLogIndex) {
+                return 0;
             }
             final LogEntry entry = getEntryFromMemory(index);
             if (entry != null) {
@@ -750,11 +781,11 @@ public class LogManagerImpl implements LogManager {
     }
 
     private long getTermFromLogStorage(final long index) {
-        LogEntry entry = this.logStorage.getEntry(index);
+        final LogEntry entry = this.logStorage.getEntry(index);
         if (entry != null) {
             if (this.raftOptions.isEnableLogEntryChecksum() && entry.isCorrupted()) {
                 // Report error to node and throw exception.
-                String msg = String.format(
+                final String msg = String.format(
                     "The log entry is corrupted, index=%d, term=%d, expectedChecksum=%d, realChecksum=%d", entry
                         .getId().getIndex(), entry.getId().getTerm(), entry.getChecksum(), entry.checksum());
                 reportError(RaftError.EIO.getNumber(), msg);
@@ -811,12 +842,13 @@ public class LogManagerImpl implements LogManager {
         if (index == 0) {
             return 0;
         }
-        if (index > this.lastLogIndex) {
-            return 0;
-        }
+
         final LogId lss = this.lastSnapshotId;
         if (index == lss.getIndex()) {
             return lss.getTerm();
+        }
+        if (index > this.lastLogIndex || index < this.firstLogIndex) {
+            return 0;
         }
         final LogEntry entry = getEntryFromMemory(index);
         if (entry != null) {
