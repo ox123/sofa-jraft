@@ -94,7 +94,7 @@ import com.alipay.sofa.jraft.rpc.RpcRequests.TimeoutNowResponse;
 import com.alipay.sofa.jraft.rpc.RpcResponseClosure;
 import com.alipay.sofa.jraft.rpc.RpcResponseClosureAdapter;
 import com.alipay.sofa.jraft.rpc.RpcResponseFactory;
-import com.alipay.sofa.jraft.rpc.impl.core.BoltRaftClientService;
+import com.alipay.sofa.jraft.rpc.impl.core.DefaultRaftClientService;
 import com.alipay.sofa.jraft.storage.LogManager;
 import com.alipay.sofa.jraft.storage.LogStorage;
 import com.alipay.sofa.jraft.storage.RaftMetaStorage;
@@ -116,6 +116,7 @@ import com.alipay.sofa.jraft.util.SignalHelper;
 import com.alipay.sofa.jraft.util.ThreadHelper;
 import com.alipay.sofa.jraft.util.ThreadId;
 import com.alipay.sofa.jraft.util.Utils;
+import com.alipay.sofa.jraft.util.timer.RaftTimerFactory;
 import com.google.protobuf.Message;
 import com.lmax.disruptor.BlockingWaitStrategy;
 import com.lmax.disruptor.EventFactory;
@@ -151,6 +152,11 @@ public class NodeImpl implements Node, RaftServerService {
             LOG.error("Fail to add signal.", t);
         }
     }
+
+    private final static RaftTimerFactory                                  TIMER_FACTORY            = JRaftServiceLoader
+                                                                                                        .load(
+                                                                                                            RaftTimerFactory.class) //
+                                                                                                        .first();
 
     // Max retry times when applying tasks.
     private static final int                                               MAX_APPLY_RETRY_TIMES    = 3;
@@ -194,7 +200,7 @@ public class NodeImpl implements Node, RaftServerService {
     private RaftClientService                                              rpcService;
     private ReadOnlyService                                                readOnlyService;
     /** Timers */
-    private TimerManager                                                   timerManager;
+    private Scheduler                                                      timerManager;
     private RepeatedTimer                                                  electionTimer;
     private RepeatedTimer                                                  voteTimer;
     private RepeatedTimer                                                  stepDownTimer;
@@ -677,8 +683,10 @@ public class NodeImpl implements Node, RaftServerService {
                 // Update target priority value
                 final int prevTargetPriority = this.targetPriority;
                 this.targetPriority = getMaxPriorityOfNodes(this.conf.getConf().getPeers());
-                LOG.info("Node {} target priority value has changed from: {}, to: {}.", getNodeId(),
-                    prevTargetPriority, this.targetPriority);
+                if (prevTargetPriority != this.targetPriority) {
+                    LOG.info("Node {} target priority value has changed from: {}, to: {}.", getNodeId(),
+                        prevTargetPriority, this.targetPriority);
+                }
                 this.electionTimeoutCounter = 0;
             }
         } finally {
@@ -863,15 +871,14 @@ public class NodeImpl implements Node, RaftServerService {
             return false;
         }
 
-        this.timerManager = new TimerManager();
-        if (!this.timerManager.init(this.options.getTimerPoolSize())) {
-            LOG.error("Fail to init timer manager.");
-            return false;
-        }
+        this.timerManager = TIMER_FACTORY.getRaftScheduler(this.options.isSharedTimerPool(),
+            this.options.getTimerPoolSize(), "JRaft-Node-ScheduleThreadPool");
 
         // Init timers
         final String suffix = getNodeId().toString();
-        this.voteTimer = new RepeatedTimer("JRaft-VoteTimer-" + suffix, this.options.getElectionTimeoutMs()) {
+        String name = "JRaft-VoteTimer-" + suffix;
+        this.voteTimer = new RepeatedTimer(name, this.options.getElectionTimeoutMs(), TIMER_FACTORY.getVoteTimer(
+            this.options.isSharedVoteTimer(), name)) {
 
             @Override
             protected void onTrigger() {
@@ -883,7 +890,9 @@ public class NodeImpl implements Node, RaftServerService {
                 return randomTimeout(timeoutMs);
             }
         };
-        this.electionTimer = new RepeatedTimer("JRaft-ElectionTimer-" + suffix, this.options.getElectionTimeoutMs()) {
+        name = "JRaft-ElectionTimer-" + suffix;
+        this.electionTimer = new RepeatedTimer(name, this.options.getElectionTimeoutMs(),
+            TIMER_FACTORY.getElectionTimer(this.options.isSharedElectionTimer(), name)) {
 
             @Override
             protected void onTrigger() {
@@ -895,16 +904,18 @@ public class NodeImpl implements Node, RaftServerService {
                 return randomTimeout(timeoutMs);
             }
         };
-        this.stepDownTimer = new RepeatedTimer("JRaft-StepDownTimer-" + suffix,
-            this.options.getElectionTimeoutMs() >> 1) {
+        name = "JRaft-StepDownTimer-" + suffix;
+        this.stepDownTimer = new RepeatedTimer(name, this.options.getElectionTimeoutMs() >> 1,
+            TIMER_FACTORY.getStepDownTimer(this.options.isSharedStepDownTimer(), name)) {
 
             @Override
             protected void onTrigger() {
                 handleStepDownTimeout();
             }
         };
-        this.snapshotTimer = new RepeatedTimer("JRaft-SnapshotTimer-" + suffix,
-            this.options.getSnapshotIntervalSecs() * 1000) {
+        name = "JRaft-SnapshotTimer-" + suffix;
+        this.snapshotTimer = new RepeatedTimer(name, this.options.getSnapshotIntervalSecs() * 1000,
+            TIMER_FACTORY.getSnapshotTimer(this.options.isSharedSnapshotTimer(), name)) {
 
             private volatile boolean firstSchedule = true;
 
@@ -998,7 +1009,7 @@ public class NodeImpl implements Node, RaftServerService {
 
         // TODO RPC service and ReplicatorGroup is in cycle dependent, refactor it
         this.replicatorGroup = new ReplicatorGroupImpl();
-        this.rpcService = new BoltRaftClientService(this.replicatorGroup);
+        this.rpcService = new DefaultRaftClientService(this.replicatorGroup);
         final ReplicatorGroupOptions rgOpts = new ReplicatorGroupOptions();
         rgOpts.setHeartbeatTimeoutMs(heartbeatTimeout(this.options.getElectionTimeoutMs()));
         rgOpts.setElectionTimeoutMs(this.options.getElectionTimeoutMs());
@@ -1264,7 +1275,7 @@ public class NodeImpl implements Node, RaftServerService {
         }
         // Learner node will not trigger the election timer.
         if (!isLearner()) {
-            this.electionTimer.start();
+            this.electionTimer.restart();
         } else {
             LOG.info("Node {} is a learner, election timer is not started.", this.nodeId);
         }
@@ -2101,6 +2112,11 @@ public class NodeImpl implements Node, RaftServerService {
     }
 
     private void checkDeadNodes(final Configuration conf, final long monotonicNowMs) {
+        // Check learner replicators at first.
+        for (PeerId peer : conf.getLearners()) {
+            checkReplicator(peer);
+        }
+        // Ensure quorum nodes alive.
         final List<PeerId> peers = conf.listPeers();
         final Configuration deadNodes = new Configuration();
         if (checkDeadNodes0(peers, monotonicNowMs, true, deadNodes)) {
@@ -2293,7 +2309,7 @@ public class NodeImpl implements Node, RaftServerService {
         return this.options;
     }
 
-    public TimerManager getTimerManager() {
+    public Scheduler getTimerManager() {
         return this.timerManager;
     }
 
@@ -2529,7 +2545,7 @@ public class NodeImpl implements Node, RaftServerService {
             if (this.snapshotExecutor != null && this.snapshotExecutor.isInstallingSnapshot()) {
                 LOG.warn(
                     "Node {} term {} doesn't do preVote when installing snapshot as the configuration may be out of date.",
-                    getNodeId());
+                    getNodeId(), this.currTerm);
                 return;
             }
             if (!this.conf.contains(this.serverId)) {

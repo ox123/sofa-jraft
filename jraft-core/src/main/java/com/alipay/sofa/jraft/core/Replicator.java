@@ -109,7 +109,7 @@ public class Replicator implements ThreadId.OnError {
     private ScheduledFuture<?>               heartbeatTimer;
     private volatile SnapshotReader          reader;
     private CatchUpClosure                   catchUpClosure;
-    private final TimerManager               timerManager;
+    private final Scheduler                  timerManager;
     private final NodeMetrics                nodeMetrics;
     private volatile State                   state;
 
@@ -1048,7 +1048,6 @@ public class Replicator implements ThreadId.OnError {
     void destroy() {
         final ThreadId savedId = this.id;
         LOG.info("Replicator {} is going to quit", savedId);
-        this.id = null;
         releaseReader();
         // Unregister replicator metric set
         if (this.nodeMetrics.isEnabled()) {
@@ -1058,6 +1057,7 @@ public class Replicator implements ThreadId.OnError {
         this.state = State.Destroyed;
         notifyReplicatorStatusListener((Replicator) savedId.getData(), ReplicatorEvent.DESTROYED);
         savedId.unlockAndDestroy();
+        this.id = null;
     }
 
     private void releaseReader() {
