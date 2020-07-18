@@ -4,7 +4,7 @@
 
     <groupId>com.alipay.sofa</groupId>
     <artifactId>jraft-parent</artifactId>
-    <version>1.3.2.beta1</version>
+    <version>1.3.3</version>
     <packaging>pom</packaging>
 
     <name>${project.groupId}:${project.artifactId}</name>
@@ -450,8 +450,8 @@
                         <exclude>**/Timeout.java</exclude>
                         <exclude>**/TimerTask.java</exclude>
                         <exclude>**/NonReentrantLock.java</exclude>
-                        <exclude>**/Bits.java</exclude>
                         <exclude>**/UnsafeUtf8Util.java</exclude>
+                        <exclude>**/HeapByteBufUtil.java</exclude>
                     </excludes>
                     <strictCheck>true</strictCheck>
                     <mapping>
