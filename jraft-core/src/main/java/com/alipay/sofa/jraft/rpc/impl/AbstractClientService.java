@@ -82,6 +82,15 @@ public abstract class AbstractClientService implements ClientService {
     }
 
     @Override
+    public boolean checkConnection(final Endpoint endpoint, final boolean createIfAbsent) {
+        final RpcClient rc = this.rpcClient;
+        if (rc == null) {
+            throw new IllegalStateException("Client service is uninitialized.");
+        }
+        return rc.checkConnection(endpoint, createIfAbsent);
+    }
+
+    @Override
     public synchronized boolean init(final RpcOptions rpcOptions) {
         if (this.rpcClient != null) {
             return true;
@@ -185,11 +194,13 @@ public abstract class AbstractClientService implements ClientService {
                                                               final Executor rpcExecutor) {
         final RpcClient rc = this.rpcClient;
         final FutureImpl<Message> future = new FutureImpl<>();
+        final Executor currExecutor = rpcExecutor != null ? rpcExecutor : this.rpcExecutor;
         try {
             if (rc == null) {
                 future.failure(new IllegalStateException("Client service is uninitialized."));
                 // should be in another thread to avoid dead locking.
-                RpcUtils.runClosureInThread(done, new Status(RaftError.EINTERNAL, "Client service is uninitialized."));
+                RpcUtils.runClosureInExecutor(currExecutor, done, new Status(RaftError.EINTERNAL,
+                    "Client service is uninitialized."));
                 return future;
             }
 
@@ -205,33 +216,35 @@ public abstract class AbstractClientService implements ClientService {
 
                     if (err == null) {
                         Status status = Status.OK();
+                        Message msg;
                         if (result instanceof ErrorResponse) {
                             status = handleErrorResponse((ErrorResponse) result);
+                            msg = (Message) result;
                         } else if (result instanceof Message) {
                             final Descriptors.FieldDescriptor fd = ((Message) result).getDescriptorForType() //
                                 .findFieldByNumber(RpcResponseFactory.ERROR_RESPONSE_NUM);
                             if (fd != null && ((Message) result).hasField(fd)) {
                                 final ErrorResponse eResp = (ErrorResponse) ((Message) result).getField(fd);
                                 status = handleErrorResponse(eResp);
+                                msg = eResp;
                             } else {
-                                if (done != null) {
-                                    done.setResponse((T) result);
-                                }
+                                msg = (T) result;
                             }
                         } else {
-                            if (done != null) {
-                                done.setResponse((T) result);
-                            }
+                            msg = (T) result;
                         }
                         if (done != null) {
                             try {
+                                if (status.isOk()) {
+                                    done.setResponse((T) msg);
+                                }
                                 done.run(status);
                             } catch (final Throwable t) {
                                 LOG.error("Fail to run RpcResponseClosure, the request is {}.", request, t);
                             }
                         }
                         if (!future.isDone()) {
-                            future.setResult((Message) result);
+                            future.setResult(msg);
                         }
                     } else {
                         if (done != null) {
@@ -250,19 +263,20 @@ public abstract class AbstractClientService implements ClientService {
 
                 @Override
                 public Executor executor() {
-                    return rpcExecutor != null ? rpcExecutor : AbstractClientService.this.rpcExecutor;
+                    return currExecutor;
                 }
             }, timeoutMs <= 0 ? this.rpcOptions.getRpcDefaultTimeout() : timeoutMs);
         } catch (final InterruptedException e) {
             Thread.currentThread().interrupt();
             future.failure(e);
             // should be in another thread to avoid dead locking.
-            Utils.runClosureInThread(done, new Status(RaftError.EINTR, "Sending rpc was interrupted"));
+            RpcUtils.runClosureInExecutor(currExecutor, done,
+                new Status(RaftError.EINTR, "Sending rpc was interrupted"));
         } catch (final RemotingException e) {
             future.failure(e);
             // should be in another thread to avoid dead locking.
-            Utils.runClosureInThread(done,
-                new Status(RaftError.EINTERNAL, "Fail to send a RPC request:" + e.getMessage()));
+            RpcUtils.runClosureInExecutor(currExecutor, done, new Status(RaftError.EINTERNAL,
+                "Fail to send a RPC request:" + e.getMessage()));
 
         }
 
